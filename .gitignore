@@ -1,0 +1,28 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+*.7z
+*.zip
+*.tar.gz
+/vRY-*
+
+# Runtime/user data
+config.json
+logs/
+*.log
+
+# Local tooling
+.idea/
+.vscode/
+.pytest_cache/
+.coverage
+coverage.xml

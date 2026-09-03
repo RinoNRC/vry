@@ -1,0 +1,41 @@
+name: Release Windows build
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install cx_Freeze
+
+      - name: Build
+        run: python setup.py build
+
+      - name: Package
+        shell: powershell
+        run: Compress-Archive -Path "build\exe.win-amd64-3.11\*" -DestinationPath "vRY-${{ github.ref_name }}-win64.zip"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: vRY-${{ github.ref_name }}-win64.zip
