@@ -27,6 +27,12 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install cx_Freeze
 
+      - name: Check dependencies
+        run: python -m pip check
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Build
         run: python setup.py build
 

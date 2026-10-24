@@ -1,120 +1,133 @@
+import time
+from collections import OrderedDict
+
+from requests.exceptions import RequestException
+
+
+def _mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _integer(value, default=0):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return default
+    try:
+        number = int(value)
+    except ValueError:
+        return default
+    return number if number >= 0 else default
+
+
+def _seasons(payload):
+    competitive = _mapping(_mapping(_mapping(payload).get("QueueSkills")).get("competitive"))
+    if "SeasonalInfoBySeasonID" not in competitive:
+        return None
+    seasons = competitive["SeasonalInfoBySeasonID"]
+    return {} if seasons is None else seasons if isinstance(seasons, dict) else None
+
 
 class Rank:
+    CACHE_TTL = 300
+    CACHE_MAX_ENTRIES = 128
+
     def __init__(self, Requests, log, content, ranks_before):
         self.Requests = Requests
         self.log = log
         self.ranks_before = ranks_before
         self.content = content
-        self.requestMap = {}
+        self.requestMap = OrderedDict()
+        self._cache_expirations = {}
 
     def get_request(self, puuid):
+        now = time.monotonic()
+        for key in list(self.requestMap):
+            if self._cache_expirations.get(key, 0) <= now:
+                self.requestMap.pop(key, None)
+                self._cache_expirations.pop(key, None)
         if puuid in self.requestMap:
+            self.requestMap.move_to_end(puuid)
             return self.requestMap[puuid]
 
-        response = self.Requests.fetch('pd', f"/mmr/v1/players/{puuid}", "get")
-        self.requestMap[puuid] = response
+        try:
+            response = self.Requests.fetch('pd', f"/mmr/v1/players/{puuid}", "get")
+        except (RequestException, OSError, ValueError):
+            self.log("Failed getting rank")
+            return None
+        try:
+            cacheable = response is not None and response.ok and _seasons(response.json()) is not None
+        except (AttributeError, TypeError, ValueError):
+            cacheable = False
+        if cacheable:
+            self.requestMap[puuid] = response
+            self._cache_expirations[puuid] = time.monotonic() + self.CACHE_TTL
+            while len(self.requestMap) > self.CACHE_MAX_ENTRIES:
+                key, _ = self.requestMap.popitem(last=False)
+                self._cache_expirations.pop(key, None)
         return response
 
     def invalidate_cached_responses(self):
-        self.requestMap = {}
+        self.requestMap.clear()
+        self._cache_expirations.clear()
 
-    #in future rewrite this code
     def get_rank(self, puuid, seasonID):
         response = self.get_request(puuid)
-        # pyperclip.copy(str(response.json()))
         final = {
-            "rank": None,
-            "rr": None,
-            "leaderboard": None,
-            "peakrank": None,
-            "wr": None,
+            "rank": 0,
+            "rr": 0,
+            "leaderboard": 0,
+            "peakrank": 0,
+            "wr": "N/A",
             "numberofgames": 0,
             "peakrankact": None,
             "peakrankep": None,
-            "statusgood": None,
-            "statuscode": None,
-            }
+            "statusgood": bool(getattr(response, "ok", False)),
+            "statuscode": getattr(response, "status_code", None),
+        }
+        if not final["statusgood"]:
+            self.log("Failed getting rank")
+            return final
         try:
-            if response.ok:
-                # self.log("retrieved rank successfully")
-                r = response.json()
-                rankTIER = r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["CompetitiveTier"]
-                if int(rankTIER) >= 21:
-                    # rank = [rankTIER,
-                            # r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["RankedRating"],
-                            # r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["LeaderboardRank"]]
+            seasons = _seasons(response.json())
+        except (AttributeError, TypeError, ValueError):
+            seasons = None
+        if seasons is None:
+            final["statusgood"] = False
+            self.log("Invalid rank data")
+            return final
 
-                    final["rank"] = rankTIER
-                    final["rr"] = r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["RankedRating"]
-                    final["leaderboard"] = r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["LeaderboardRank"]
-                elif int(rankTIER) not in (0, 1, 2):
-                    final["rank"] = rankTIER
-                    final["rr"] = r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["RankedRating"]
-                    final["leaderboard"] = 0
+        current = _mapping(seasons.get(seasonID))
+        tier = _integer(current.get("CompetitiveTier"))
+        if 3 <= tier <= 27:
+            final["rank"] = tier
+            final["rr"] = _integer(current.get("RankedRating"))
+            if tier >= 21:
+                final["leaderboard"] = _integer(current.get("LeaderboardRank"))
 
-                    # rank = [rankTIER,
-                            # r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["RankedRating"],
-                            # 0]
-                else:
-                    final["rank"] = 0
-                    final["rr"] = 0
-                    final["leaderboard"] = 0
-
-            else:
-                self.log("failed getting rank")
-                self.log(response.text)
-                final["rank"] = 0
-                final["rr"] = 0
-                final["leaderboard"] = 0
-        except TypeError:
-            final["rank"] = 0
-            final["rr"] = 0
-            final["leaderboard"] = 0
-        except KeyError:
-            final["rank"] = 0
-            final["rr"] = 0
-            final["leaderboard"] = 0
         max_rank = final["rank"]
         max_rank_season = seasonID
-        seasons = r["QueueSkills"]["competitive"].get("SeasonalInfoBySeasonID")
-        if seasons is not None:
-            for season in r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"]:
-                if r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][season]["WinsByTier"] is not None:
-                    for winByTier in r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][season]["WinsByTier"]:
-                        if season in self.ranks_before:
-                            if int(winByTier) > 20:
-                                winByTier = int(winByTier) + 3
-                        if int(winByTier) > max_rank:
-                            max_rank = int(winByTier)
-                            max_rank_season = season
-            # rank.append(max_rank)
-            final["peakrank"] = max_rank
-        else:
-            # rank.append(max_rank)
-            final["peakrank"] = max_rank
-        try:
-            wins = r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["NumberOfWinsWithPlacements"]
-            total_games = r["QueueSkills"]["competitive"]["SeasonalInfoBySeasonID"][seasonID]["NumberOfGames"]
-            final["numberofgames"] = total_games
+        for season, stats in seasons.items():
+            for tier in _mapping(_mapping(stats).get("WinsByTier")):
+                tier = _integer(tier)
+                if season in self.ranks_before and tier > 20:
+                    tier += 3
+                if max_rank < tier <= 27:
+                    max_rank = tier
+                    max_rank_season = season
+        final["peakrank"] = max_rank
+
+        wins = _integer(current.get("NumberOfWinsWithPlacements"), default=None)
+        total_games = _integer(current.get("NumberOfGames"))
+        final["numberofgames"] = total_games
+        if total_games > 0 and wins is not None and wins <= total_games:
+            final["wr"] = wins * 100 // total_games
+
+        if max_rank_season is not None:
             try:
-                wr = int(wins / total_games * 100)
-            except ZeroDivisionError: #no loses
-                wr = 100
-        except (KeyError, TypeError): #haven't played this season, #no data?
-            # print("test")
-            wr = "N/A"
-
-
-        # rank.append(wr)
-        final["wr"] = wr
-        final["statusgood"] = response.ok
-        final["statuscode"] = response.status_code
-        
-
-        #peak rank act and ep
-        peak_rank_act_ep = self.content.get_act_episode_from_act_id(max_rank_season)
-        final["peakrankact"] = peak_rank_act_ep["act"]
-        final["peakrankep"] = peak_rank_act_ep["episode"]
+                peak = _mapping(self.content.get_act_episode_from_act_id(max_rank_season))
+                final["peakrankact"] = peak.get("act")
+                final["peakrankep"] = peak.get("episode")
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                pass
         return final
 
 

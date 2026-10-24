@@ -8,6 +8,7 @@ class AppStateStore:
         self._lock = threading.RLock()
         self._started_at = time.time()
         self._revision = 0
+        self._history_revision = 0
         self._status = "Starting"
         self._error = None
         self._heartbeat = {}
@@ -37,9 +38,22 @@ class AppStateStore:
     def publish(self, event_type, payload):
         data = copy.deepcopy(payload)
         with self._lock:
-            if event_type == "heartbeat":
+            if event_type == "disconnected":
+                self._heartbeat = {}
+                self._loadouts = {}
+                self._account = {}
+                self._chat = []
+                self._status = "DISCONNECTED"
+                self._error = None
+                self._add_event("warning", "Клиент отключён", "Ожидание повторного подключения")
+            elif event_type == "heartbeat":
                 previous_state = self._heartbeat.get("state")
                 previous_match = self._heartbeat.get("matchId")
+                if self._stats_context(data) == self._stats_context(self._heartbeat):
+                    for puuid, player in (data.get("players") or {}).items():
+                        recent = (self._heartbeat.get("players") or {}).get(puuid, {}).get("recentStats")
+                        if recent:
+                            self._apply_recent_stats(player, recent)
                 self._heartbeat = data
                 self._heartbeat_at = time.time()
                 self._heartbeat_history.append(self._heartbeat_at)
@@ -49,7 +63,18 @@ class AppStateStore:
                 account_puuid = data.get("puuid")
                 account_player = (data.get("players") or {}).get(account_puuid)
                 if account_player:
-                    previous_profile = self._account.get("profile", {})
+                    previous_profile = dict(self._account.get("profile", {}))
+                    if previous_profile.get("puuid") != account_puuid:
+                        previous_profile = {}
+                    same_stats_context = self._stats_context(data) == (
+                        account_puuid,
+                        self._account.get("matchId"),
+                        self._account.get("state"),
+                    )
+                    if not same_stats_context:
+                        previous_profile.pop("recentStats", None)
+                    elif previous_profile.get("recentStats"):
+                        self._apply_recent_stats(account_player, previous_profile["recentStats"])
                     self._account = {
                         "profile": previous_profile | account_player,
                         "state": data.get("state"),
@@ -73,6 +98,17 @@ class AppStateStore:
                         "Новая игровая сессия",
                         f"{data.get('mode', 'Unknown')} / {data.get('map') or 'Unknown'}",
                     )
+            elif event_type == "recentStats":
+                context = (data.get("accountPuuid"), data.get("matchId"), data.get("state"))
+                if context != self._stats_context(self._heartbeat):
+                    return
+                puuid = data.get("puuid")
+                player = (self._heartbeat.get("players") or {}).get(puuid)
+                if player is None:
+                    return
+                self._apply_recent_stats(player, data["stats"])
+                if puuid == self._heartbeat.get("puuid"):
+                    self._apply_recent_stats(self._account.setdefault("profile", {}), data["stats"])
             elif event_type == "matchLoadout":
                 self._loadouts = data
                 self._add_event(
@@ -80,15 +116,35 @@ class AppStateStore:
                     "Инвентари обновлены",
                     f"Игроков: {len(data.get('Players') or {})}",
                 )
+            elif event_type == "historyUpdated":
+                self._history_revision += 1
             elif event_type == "chat":
                 self._chat.append(data)
                 self._chat = self._chat[-100:]
             self._touch()
 
+    @staticmethod
+    def _stats_context(heartbeat):
+        return heartbeat.get("puuid"), heartbeat.get("matchId"), heartbeat.get("state")
+
+    @staticmethod
+    def _apply_recent_stats(player, stats):
+        player["recentStats"] = copy.deepcopy(stats)
+        player["headshotPercentage"] = stats.get("hs", "N/A")
+        player["kd"] = stats.get("kd", "N/A")
+        if stats.get("requestedMatches") == 1:
+            player["earnedRR"] = stats.get("RankedRatingEarned", "N/A")
+            player["afkPenalty"] = stats.get("AFKPenalty", "N/A")
+
+    def get_revision(self):
+        with self._lock:
+            return self._revision
+
     def snapshot(self):
         with self._lock:
             return {
                 "revision": self._revision,
+                "history_revision": self._history_revision,
                 "status": self._status,
                 "error": self._error,
                 "heartbeat": copy.deepcopy(self._heartbeat),

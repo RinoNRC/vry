@@ -18,10 +18,10 @@ from src.constants import version
 
 build_exe_options = {
     "path": sys.path,
-    "include_files":['configurator.bat', 'updatescript.bat', 'assets'],
+    "include_files":['configurator.bat', 'updatescript.bat', 'assets', 'LICENSE', 'config.example.json'],
     "includes": ["main"],
     "packages": ["requests", "colr", "flet", "flet_desktop", "winotify", "InquirerPy", "websockets", "pypresence", "nest_asyncio", "rich"],
-    "excludes": ["tkinter", "test", "unittest", "pygments", "xmlrpc"]
+    "excludes": ["tkinter", "test", "unittest", "xmlrpc"]
 }
 
 setup(

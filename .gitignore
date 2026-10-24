@@ -20,7 +20,19 @@ config.json
 logs/
 *.log
 
+# Credentials and private runtime exports
+.env
+.env.*
+!.env.example
+cookies/
+accounts/
+lockfile
+stats.json
+stats.json.*
+config.json.*
+
 # Local tooling
+.claude/
 .idea/
 .vscode/
 .pytest_cache/

@@ -39,6 +39,12 @@ jobs:
       - name: Install cx_Freeze
         run: pip install cx_Freeze
       
+      - name: Check dependencies
+        run: python -m pip check
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
       - name: Build Native Executable
         run: python setup.py build
       

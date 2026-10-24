@@ -1,7 +1,5 @@
 import base64
-import json
 import time
-from json.decoder import JSONDecodeError
 import requests
 from colr import color
 import os
@@ -10,7 +8,6 @@ import sys
 import zipfile
 import io
 import subprocess
-from requests.exceptions import ConnectionError
 
 class Requests:
     def __init__(self, version, log, Error):
@@ -36,9 +33,11 @@ class Requests:
 
     @staticmethod
     def check_version(version, copy_run_update_script):
+        if os.getenv("VRY_GUI") == "1":
+            return
         # checking for latest release
         try:
-            r = requests.get("https://api.github.com/repos/zayKenyon/VALORANT-rank-yoinker/releases")
+            r = requests.get("https://api.github.com/repos/zayKenyon/VALORANT-rank-yoinker/releases", timeout=(3, 10))
         except requests.exceptions.RequestException:
             print(color("[WARNING] Unable to check for updates - skipping...", fore=(255, 165, 0)))
             return
@@ -68,22 +67,27 @@ class Requests:
 
     @staticmethod
     def copy_run_update_script(link):
+        if os.getenv("VRY_GUI") == "1":
+            return
         try:
             os.mkdir(os.path.join(os.getenv('APPDATA'), "vry"))
         except FileExistsError:
             pass
         shutil.copyfile("updatescript.bat", os.path.join(os.getenv('APPDATA'), "vry", "updatescript.bat"))
-        r_zip = requests.get(link, stream=True)
+        r_zip = requests.get(link, stream=True, timeout=(3, 30))
+        r_zip.raise_for_status()
         z = zipfile.ZipFile(io.BytesIO(r_zip.content))
         z.extractall(os.path.join(os.getenv('APPDATA'), "vry"))
         subprocess.Popen([os.path.join(os.getenv('APPDATA'), "vry", "updatescript.bat"), os.path.join(os.getenv('APPDATA'), "vry", ".".join(os.path.basename(link).split(".")[:-1])), os.getcwd(), os.path.join(os.getenv('APPDATA'), "vry")])
 
     @staticmethod
     def check_status():
+        if os.getenv("VRY_GUI") == "1":
+            return
         # checking status
         try:
             rStatus = requests.get(
-                "https://raw.githubusercontent.com/zayKenyon/VALORANT-rank-yoinker/main/status.json")
+                "https://raw.githubusercontent.com/zayKenyon/VALORANT-rank-yoinker/main/status.json", timeout=(3, 10))
         except requests.exceptions.RequestException:
             print(color("[WARNING] Unable to check status - skipping...", fore=(255, 165, 0)))
             return
@@ -97,99 +101,103 @@ class Requests:
             print(color("[WARNING] Failed processing status - skipping...", fore=(255, 165, 0)))
             return
             
-    def fetch(self, url_type: str, endpoint: str, method: str, rate_limit_seconds=5):
+    @staticmethod
+    def _payload(response):
         try:
-            if url_type == "glz":
-                response = requests.request(method, self.glz_url + endpoint, headers=self.get_headers(), verify=False)
-                self.log(f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                    f" response code: {response.status_code}")
+            payload = response.json()
+        except ValueError:
+            return None
+        return payload if isinstance(payload, (dict, list)) else None
 
-                if response.status_code == 404:
-                    return response.json()
+    @staticmethod
+    def _valid_lockfile(lockfile):
+        if not isinstance(lockfile, dict):
+            return False
+        port = lockfile.get('port')
+        password = lockfile.get('password')
+        if isinstance(port, bool) or not isinstance(port, (str, int)):
+            return False
+        if not str(port).isascii() or not str(port).isdigit() or len(str(port)) > 5:
+            return False
+        if not 1 <= int(port) <= 65535:
+            return False
+        return isinstance(password, str) and bool(password) and not any(c in password for c in ':\r\n')
 
-                try:
-                    if response.json().get("errorCode") == "BAD_CLAIMS":
-                        self.log("detected bad claims")
-                        self.headers = {}
-                        return self.fetch(url_type, endpoint, method)
-                except JSONDecodeError:
-                    pass
-                if not response.ok:
-                    if response.status_code == 429:
-                        self.log("response not ok glz endpoint: rate limit 429")
-                    else:
-                        self.log("response not ok glz endpoint: " + response.text)
-                    time.sleep(rate_limit_seconds+5)
-                    self.headers = {}
-                    self.fetch(url_type, endpoint, method)
-                return response.json()
-            elif url_type == "pd":
-                response = requests.request(method, self.pd_url + endpoint, headers=self.get_headers(), verify=False)
-                self.log(
-                    f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                    f" response code: {response.status_code}")
-                if response.status_code == 404:
-                    return response
+    def _local_headers(self):
+        if not self._valid_lockfile(self.lockfile):
+            return None
+        return {'Authorization': 'Basic ' + base64.b64encode(('riot:' + self.lockfile['password']).encode()).decode()}
 
-                try:
-                    if response.json().get("errorCode") == "BAD_CLAIMS":
-                        self.log("detected bad claims")
-                        self.headers = {}
-                        return self.fetch(url_type, endpoint, method)
-                except JSONDecodeError:
-                    pass
-
-                if not response.ok:
-                    if response.status_code == 429:
-                        self.log(f"response not ok pd endpoint, rate limit 429")
-                    else:
-                        self.log(f"response not ok pd endpoint, {response.text}")
-                    time.sleep(rate_limit_seconds+5)
-                    self.headers = {}
-                    return self.fetch(url_type, endpoint, method, rate_limit_seconds=rate_limit_seconds+5)
-                return response
-            elif url_type == "local":
-                local_headers = {'Authorization': 'Basic ' + base64.b64encode(
-                    ('riot:' + self.lockfile['password']).encode()).decode()}
-                
-                max_retries = 3
-                for i in range(max_retries):
-                    try:
-                        response = requests.request(method, f"https://127.0.0.1:{self.lockfile['port']}{endpoint}",
-                                                    headers=local_headers,
-                                                    verify=False, timeout=5)
-                        if response.status_code == 200 and response.json().get("errorCode") != "RPC_ERROR":
-                            if endpoint != "/chat/v4/presences":
-                                self.log(
-                                    f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                                    f" response code: {response.status_code}")
-                            return response.json()
-                        else:
-                            self.log(f"Local API is not ready yet (RPC_ERROR or status code {response.status_code}). Retrying...")
-                            time.sleep(5)
-                    except (requests.exceptions.RequestException, ConnectionError):
-                        self.log(f"Connection error on local request. Retrying... ({i + 1}/{max_retries})")
-                        time.sleep(5)
-                
-                self.log(f"Failed to connect to local client after {max_retries} attempts.")
+    def fetch(self, url_type: str, endpoint: str, method: str, rate_limit_seconds=5, json=None):
+        request_kwargs = {} if json is None else {"json": json}
+        if url_type == "local":
+            local_headers = self._local_headers()
+            if local_headers is None:
+                self.log("Invalid lockfile for local request.")
                 return None
-            elif url_type == "custom":
-                response = requests.request(method, f"{endpoint}", headers=self.get_headers(), verify=False)
-                self.log(
-                    f"fetch: url: '{url_type}', endpoint: {endpoint}, method: {method},"
-                    f" response code: {response.status_code}")
-                if not response.ok: self.headers = {}
-                return response.json()
-        except json.decoder.JSONDecodeError:
-            self.log(f"JSONDecodeError in fetch function, resp.code: {response.status_code}, resp_text: '{response.text}")
-            print(response)
-            print(response.text)
+            for attempt in range(3):
+                try:
+                    response = requests.request(
+                        method, f"https://127.0.0.1:{self.lockfile['port']}{endpoint}",
+                        headers=local_headers, verify=False, timeout=5, **request_kwargs)
+                except requests.exceptions.RequestException:
+                    self.log("Connection error on local request.")
+                else:
+                    payload = self._payload(response)
+                    rpc_error = isinstance(payload, dict) and payload.get("errorCode") == "RPC_ERROR"
+                    if response.status_code == 200 and payload is not None and not rpc_error:
+                        return payload
+                    self.log(f"Local request failed, response code: {response.status_code}")
+                    if response.status_code in {401, 403, 404}:
+                        return None
+                    if response.status_code != 200 and response.status_code != 429 and response.status_code < 500:
+                        return None
+                if attempt < 2:
+                    time.sleep(1)
+            return None
+
+        if url_type not in {"pd", "glz", "custom"}:
+            return None
+        url = endpoint if url_type == "custom" else (
+            self.pd_url if url_type == "pd" else self.glz_url) + endpoint
+        headers = self.get_headers()
+        if not headers:
+            return None
+        for attempt in range(2):
+            try:
+                response = requests.request(
+                    method, url, headers=headers, verify=True, timeout=(3, 7), **request_kwargs)
+            except requests.exceptions.RequestException:
+                self.log(f"Connection error on {url_type} request.")
+                if attempt == 0:
+                    time.sleep(min(max(rate_limit_seconds, 1), 5))
+                    continue
+                return None
+            self.log(f"fetch: url: '{url_type}', method: {method}, response code: {response.status_code}")
+            payload = self._payload(response)
+            result = response if url_type == "pd" else payload
+            if response.status_code in {403, 404}:
+                return result
+            bad_claims = isinstance(payload, dict) and payload.get("errorCode") == "BAD_CLAIMS"
+            if response.status_code == 401 or bad_claims:
+                if attempt == 0:
+                    headers = self.get_headers(refresh=True)
+                    if headers:
+                        continue
+                return result
+            if attempt == 0 and (response.status_code == 429 or response.status_code >= 500):
+                time.sleep(min(max(rate_limit_seconds, 1), 5))
+                continue
+            return result
+        return None
 
     def get_region(self):
         path = os.path.join(os.getenv('LOCALAPPDATA'), R'VALORANT\Saved\Logs\ShooterGame.log')
         with open(path, "r", encoding="utf8") as file:
             while True:
                 line = file.readline()
+                if not line:
+                    raise RuntimeError("Could not find Riot API region in ShooterGame.log")
                 if '.a.pvp.net/account-xp/v1/' in line:
                     pd_url = line.split('.a.pvp.net/account-xp/v1/')[0].split('.')[-1]
                 elif 'https://glz' in line:
@@ -198,7 +206,7 @@ class Requests:
                 if "pd_url" in locals().keys() and "glz_url" in locals().keys():
                     self.log(f"got region from logs '{[pd_url, glz_url]}'")
                     if pd_url == "pbe":
-                        return ["na", "na-1", "na"]
+                        return ["na", ["na-1", "na"]]
                     return [pd_url, glz_url]
 
     def get_current_version(self):
@@ -206,6 +214,8 @@ class Requests:
         with open(path, "r", encoding="utf8") as file:
             while True:
                 line = file.readline()
+                if not line:
+                    raise RuntimeError("Could not find CI server version in ShooterGame.log")
                 if 'CI server version:' in line:
                     version_without_shipping = line.split('CI server version: ')[1].strip()
                     version = version_without_shipping.split("-")
@@ -220,50 +230,64 @@ class Requests:
         if self.Error.LockfileError(path, ignoreLockfile=ignoreLockfile):
             with open(path) as lockfile:
                 self.log("opened lockfile")
-                data = lockfile.read().split(':')
+                data = lockfile.read().strip().split(':')
                 keys = ['name', 'PID', 'port', 'password', 'protocol']
-                return dict(zip(keys, data))
+                if len(data) == len(keys):
+                    parsed = dict(zip(keys, data))
+                    if self._valid_lockfile(parsed):
+                        return parsed
+                self.log("Invalid lockfile structure.")
+                return None
 
 
     def get_headers(self, refresh=False, init=False):
-        if self.headers == {} or refresh:
-            try_again = True
-            while try_again:
-                local_headers = {'Authorization': 'Basic ' + base64.b64encode(
-                    ('riot:' + self.lockfile['password']).encode()).decode()}
-                try:
-                    response = requests.get(f"https://127.0.0.1:{self.lockfile['port']}/entitlements/v1/token",
-                                            headers=local_headers, verify=False)
-                    self.log(f"https://127.0.0.1:{self.lockfile['port']}/entitlements/v1/token\n{local_headers}")
-                except ConnectionError:
-                    self.log(f"https://127.0.0.1:{self.lockfile['port']}/entitlements/v1/token\n{local_headers}")
-                    self.log("Connection error, retrying in 1 seconds, getting new lockfile")
-                    time.sleep(1)
-                    self.lockfile = self.get_lockfile()
-                    continue
-                entitlements = response.json()
-                if entitlements.get("message") == "Entitlements token is not ready yet":
-                    try_again = True
-                    time.sleep(1)
-                elif entitlements.get("message") == "Invalid URI format":
-                    self.log(f"Invalid uri format: {entitlements}")
-                    if init:
-                        return False
-                    else:
-                        try_again = True
-                        time.sleep(5)
-                else:
-                    try_again = False
-
-            self.puuid = entitlements['subject']
-            headers = {
-                'Authorization': f"Bearer {entitlements['accessToken']}",
-                'X-Riot-Entitlements-JWT': entitlements['token'],
-                'X-Riot-ClientPlatform': "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjog"
-                                         "IldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5"
-                                         "MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9",
-                'X-Riot-ClientVersion': self.get_current_version(),
-                "User-Agent": "ShooterGame/13 Windows/10.0.19043.1.256.64bit"
-            }
-            self.headers = headers
-        return self.headers
+        if self.headers and not refresh:
+            return self.headers
+        local_headers = self._local_headers()
+        if local_headers is None:
+            self.log("Invalid lockfile for entitlement request.")
+            return False if init else None
+        max_attempts = 30 if init else 3
+        for attempt in range(max_attempts):
+            try:
+                response = requests.get(
+                    f"https://127.0.0.1:{self.lockfile['port']}/entitlements/v1/token",
+                    headers=local_headers, verify=False, timeout=5)
+            except requests.exceptions.RequestException:
+                self.log("Connection error while fetching Riot Client entitlement token.")
+            else:
+                entitlements = self._payload(response)
+                if response.status_code in {401, 403, 404}:
+                    break
+                if isinstance(entitlements, dict) and entitlements.get("message") == "Invalid URI format":
+                    self.log("Invalid URI format while fetching entitlement token.")
+                    break
+                if response.ok and isinstance(entitlements, dict) and all(
+                        isinstance(entitlements.get(key), str) and entitlements[key].strip()
+                        and not any(c in entitlements[key] for c in '\r\n')
+                        for key in ('subject', 'accessToken', 'token')):
+                    try:
+                        version = self.get_current_version()
+                    except (OSError, RuntimeError, ValueError):
+                        self.log("Unable to read Riot Client version.")
+                        break
+                    headers = {
+                        'Authorization': f"Bearer {entitlements['accessToken']}",
+                        'X-Riot-Entitlements-JWT': entitlements['token'],
+                        'X-Riot-ClientPlatform': "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjog"
+                                                 "IldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5"
+                                                 "MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9",
+                        'X-Riot-ClientVersion': version,
+                        "User-Agent": "ShooterGame/13 Windows/10.0.19043.1.256.64bit"
+                    }
+                    self.puuid = entitlements['subject']
+                    self.headers = headers
+                    self.log("Fetched Riot Client entitlement token.")
+                    return headers
+                self.log(f"Entitlement token unavailable, response code: {response.status_code}")
+                if response.status_code != 200 and response.status_code != 429 and response.status_code < 500:
+                    break
+            if attempt < max_attempts - 1:
+                time.sleep(1)
+        self.log("Riot Client did not provide an entitlement token.")
+        return False if init else None

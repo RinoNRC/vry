@@ -1,78 +1,148 @@
 import json
-from io import TextIOWrapper
-from json import JSONDecodeError
-import requests
 import os
+import shutil
+import sys
+import tempfile
+from copy import deepcopy
+from io import TextIOWrapper
+from pathlib import Path
+from uuid import uuid4
 
-from src.constants import DEFAULT_CONFIG
+from src.constants import DEFAULT_CONFIG, WEAPONS
+
+
+def application_root():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+def config_path():
+    return application_root() / "config.json"
+
+
+def save_config(config, path=None):
+    path = Path(path) if path is not None else config_path()
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(config, file, indent=4, ensure_ascii=False)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _merge_defaults(defaults, values):
+    result = deepcopy(values) if isinstance(values, dict) else {}
+    for key, value in defaults.items():
+        if isinstance(value, dict):
+            result[key] = _merge_defaults(value, result.get(key))
+        elif key not in result:
+            result[key] = deepcopy(value)
+    return result
+
+
+def _canonical_weapon(name):
+    if isinstance(name, str):
+        return next((weapon for weapon in WEAPONS if weapon.casefold() == name.strip().casefold()), None)
+    return None
+
 
 def apply_defaults(cls):
     for name, value in DEFAULT_CONFIG.items():
-        setattr(cls, name, value)
+        setattr(cls, name, deepcopy(value))
     return cls
+
 
 @apply_defaults
 class Config:
     def __init__(self, log):
         self.log = log
-
-        if not os.path.exists("config.json"):
-            self.log("config.json not found, creating new one")
-            with open("config.json", "w") as file:
-                config = self.config_dialog(file)
-            
+        path = config_path()
+        config = {}
+        should_save = False
         try:
-            with open("config.json", "r") as file:
-                self.log("config opened")
+            with open(path, "r", encoding="utf-8") as file:
                 config = json.load(file)
+            if not isinstance(config, dict):
+                raise ValueError("Configuration root must be an object")
+            should_save = True
+        except FileNotFoundError:
+            log("config.json not found, creating new one")
+            should_save = True
+        except (ValueError, UnicodeError):
+            backup = path.with_name(path.name + ".corrupt-" + uuid4().hex + ".bak")
+            try:
+                shutil.copyfile(path, backup)
+            except OSError:
+                log("Could not back up invalid config.json; leaving the original unchanged")
+            else:
+                log("Invalid config.json preserved in a backup; restoring defaults")
+                should_save = True
+            config = {}
+        except OSError:
+            log("Could not read config.json; using defaults without overwriting it")
 
-                keys = [k for k in config.keys()] # getting the keys in the file
-                default_keys = [k for k in DEFAULT_CONFIG.keys()] # getting the keys in the self.default
-                missingkeys = list(filter(lambda x: x not in keys, default_keys)) # comparing the keys in the file to the keys in the default and returning the missing keys
+        normalized = _merge_defaults(DEFAULT_CONFIG, config)
+        normalized["weapon"] = _canonical_weapon(normalized.get("weapon")) or DEFAULT_CONFIG["weapon"]
+        if should_save and (not path.exists() or normalized != config):
+            try:
+                save_config(normalized, path)
+            except OSError:
+                log("Could not save config.json; using settings in memory")
+        for name, value in normalized.items():
+            setattr(self, name, value)
+        self._config_signature = self._file_signature(path)
 
-                if len(missingkeys) > 0:
-                    self.log("config.json is missing keys")
-                    with open("config.json", 'w') as w:
-                        self.log(f"missing keys: " + str(missingkeys))
-                        for key in missingkeys:   
-                            config[key] = DEFAULT_CONFIG[key]
+    @staticmethod
+    def _file_signature(path):
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
 
-                        self.log("Succesfully added missing keys")
-                        json.dump(config, w, indent=4)
-    
-        except (JSONDecodeError):
-            self.log("invalid file")
-            with open("config.json", "w") as file:
-                config = self.config_dialog(file)
-        finally:
-            config = DEFAULT_CONFIG | config
-            for name, value in config.items():
-                setattr(self, name, value)
+    def reload_if_changed(self):
+        path = config_path()
+        signature = self._file_signature(path)
+        if signature == self._config_signature:
+            return False
+        self._config_signature = signature
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                config = json.load(file)
+            if not isinstance(config, dict):
+                raise ValueError("Configuration root must be an object")
+        except (OSError, ValueError, UnicodeError):
+            self.log("Could not reload config.json; keeping previous settings")
+            return False
+        normalized = _merge_defaults(DEFAULT_CONFIG, config)
+        normalized["weapon"] = _canonical_weapon(normalized.get("weapon")) or DEFAULT_CONFIG["weapon"]
+        for name, value in normalized.items():
+            setattr(self, name, value)
+        self._config_signature = signature
+        return True
 
-            self.log(f"config class dict: {self.__dict__}")
+    def get_feature_flag(self, key):
+        flags = self.__dict__.get("flags")
+        if not isinstance(flags, dict):
+            flags = {}
+        return flags.get(key, DEFAULT_CONFIG["flags"].get(key))
 
-            self.log(f"got cooldown with value '{self.cooldown}'")
-
-            if not self.weapon_check(config["weapon"]):
-                self.weapon = "vandal" # if the user manually entered a wrong name into the config file, this will be the default until changed by the user.
-            else:   
-                self.weapon = config["weapon"]
-            
-    def get_feature_flag(self,key):
-        return self.__dict__.get("flags",DEFAULT_CONFIG["flags"]).get(key,DEFAULT_CONFIG["flags"][key])
-
-    def get_table_flag(self,key):
-        return self.__dict__.get("table",DEFAULT_CONFIG["flags"]).get(key,DEFAULT_CONFIG["table"][key])         
+    def get_table_flag(self, key):
+        table = self.__dict__.get("table")
+        if not isinstance(table, dict):
+            table = {}
+        return table.get(key, DEFAULT_CONFIG["table"].get(key))
 
     def config_dialog(self, fileToWrite: TextIOWrapper):
-        self.log("color config prompt called")
-        jsonToWrite = DEFAULT_CONFIG
-        
-        json.dump(jsonToWrite, fileToWrite, indent=4)
-        return jsonToWrite
+        config = deepcopy(DEFAULT_CONFIG)
+        json.dump(config, fileToWrite, indent=4, ensure_ascii=False)
+        return config
 
     def weapon_check(self, name):
-        if name in [weapon["displayName"] for weapon in requests.get("https://valorant-api.com/v1/weapons").json()["data"]]:
-            return True
-        else:
-            return False
+        return _canonical_weapon(name) is not None

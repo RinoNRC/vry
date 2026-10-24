@@ -1,6 +1,7 @@
 import base64
+import binascii
 import json
-import time
+
 
 class Presences:
     def __init__(self, Requests, log):
@@ -8,49 +9,61 @@ class Presences:
         self.log = log
 
     def get_presence(self):
-        presences = self.Requests.fetch(url_type="local", endpoint="/chat/v4/presences", method="get")
-        if presences is None:
+        response = self.Requests.fetch(url_type="local", endpoint="/chat/v4/presences", method="get")
+        if not isinstance(response, dict) or not isinstance(response.get("presences"), list):
             return None
-        return presences['presences']
+        return response["presences"]
+
+    @staticmethod
+    def decode_private(private):
+        if isinstance(private, dict):
+            return private
+        if not isinstance(private, (str, bytes)) or not private:
+            return None
+        try:
+            raw = private.strip()
+            json_prefixes = ("{", "[") if isinstance(raw, str) else (b"{", b"[")
+            if not raw.startswith(json_prefixes):
+                raw = base64.b64decode(raw, validate=True)
+            decoded = json.loads(raw)
+        except (ValueError, TypeError, UnicodeError, binascii.Error):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+
+    @staticmethod
+    def presence_section(private, section):
+        if not isinstance(private, dict):
+            return {}
+        nested = private.get(section)
+        if isinstance(nested, dict):
+            return {**private, **nested}
+        return private
+
+    @staticmethod
+    def game_state(private):
+        state = Presences.presence_section(private, "matchPresenceData").get("sessionLoopState")
+        return state if isinstance(state, str) and state else None
 
     def get_game_state(self, presences):
-        private_presence = self.get_private_presence(presences)
-        if private_presence:
-            # Temp fix: Riot is swapping between nested and flat API structures.
-            # Check for nested structure.
-            if "matchPresenceData" in private_presence:
-                return private_presence["matchPresenceData"]["sessionLoopState"]
-            # Check for flattened structure.
-            elif "sessionLoopState" in private_presence:
-                return private_presence["sessionLoopState"]
-            else:
-                # No known structure found, log and fail
-                self.log("ERROR: Unknown presence API structure in 'get_game_state'.")
-                return private_presence["matchPresenceData"]["sessionLoopState"]
-        return None
+        return self.game_state(self.get_private_presence(presences))
 
     def get_private_presence(self, presences):
+        if not isinstance(presences, list):
+            return None
         for presence in presences:
-            if presence['puuid'] == self.Requests.puuid:
-                #preventing vry from crashing when lol is open
-                # print(presence)
-                # print(presence.get("championId"))
-                if presence.get("championId") is not None or presence.get("product") == "league_of_legends":
-                    return None
-                else:
-                    if presence['private'] == "": 
-                        return None
-                    decoded_private = json.loads(base64.b64decode(presence['private']))
-                    # Debug
-                    # self.log(f"DEBUG: Decoded Private Presence -> {decoded_private}")
-                    return decoded_private
+            if not isinstance(presence, dict) or presence.get("puuid") != self.Requests.puuid:
+                continue
+            if presence.get("championId") is not None or presence.get("product") == "league_of_legends":
+                continue
+            decoded = self.decode_private(presence.get("private"))
+            if decoded is not None:
+                return decoded
         return None
 
     def decode_presence(self, private):
-        if "{" not in str(private) and private is not None and str(private) != "":
-            decoded_party_presence = json.loads(base64.b64decode(str(private)).decode("utf-8"))
-            if isinstance(decoded_party_presence, dict) and decoded_party_presence.get('isValid'):
-                return decoded_party_presence
+        decoded = self.decode_private(private)
+        if decoded and decoded.get("isValid") is True:
+            return decoded
         return {
             "isValid": False,
             "partyId": 0,
@@ -59,10 +72,5 @@ class Presences:
         }
 
     def wait_for_presence(self, PlayersPuuids):
-        while True:
-            presence = self.get_presence()
-            for puuid in PlayersPuuids:
-                if puuid not in str(presence):
-                    time.sleep(1)
-                    continue
-            break
+        # Compatibility snapshot only; name resolution does not require presence polling.
+        return self.get_presence()

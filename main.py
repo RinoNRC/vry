@@ -1,6 +1,8 @@
 import asyncio
+import atexit
 import os
 import sys
+import threading
 import time
 import traceback
 
@@ -20,6 +22,7 @@ from src.Loadouts import Loadouts
 from src.app_state import app_state
 from src.logs import Logging
 from src.names import Names
+from src.match_context import pregame_own_team
 from src.player_stats import PlayerStats
 from src.presences import Presences
 from src.rank import Rank
@@ -29,6 +32,8 @@ from src.states.coregame import Coregame
 from src.states.menu import Menu
 from src.states.pregame import Pregame
 from src.stats import Stats
+from src.history_sync import HistorySync
+from src.recent_stats_sync import RecentStatsSync
 from src.table import Table
 from src.websocket import Ws
 from src.os_info import get_os
@@ -115,7 +120,7 @@ try:
     map_splashes = content.get_map_splashes(map_info)
     rank_icons = content.get_rank_icons()
 
-    current_map = coregame.get_current_map(map_urls, map_splashes)
+    current_map = {"name": None, "splash": None}
 
     colors = Colors(log, hide_names, agent_dict, AGENTCOLORLIST)
 
@@ -123,6 +128,10 @@ try:
     table = Table(cfg, log)
 
     stats = Stats()
+    history_sync = HistorySync(stats, Requests, cfg, app_state, log)
+    history_sync.set_active_match(getattr(coregame, "match_id", None))
+    recent_stats_sync = RecentStatsSync(Requests, cfg, app_state, log)
+    recent_stats_sync.start()
 
     if cfg.get_feature_flag("discord_rpc"):
         rpc = Rpc(map_urls, gamemodes, colors, log)
@@ -136,11 +145,45 @@ try:
 
     log(f"VALORANT rank yoinker v{version}")
 
-    valoApiSkins = requests.get("https://valorant-api.com/v1/weapons/skins")
+    try:
+        valoApiSkins = requests.get("https://valorant-api.com/v1/weapons/skins", timeout=(3, 10))
+        valoApiSkins.raise_for_status()
+    except requests.RequestException:
+        log("Skin catalog unavailable; ranks and statistics remain available")
+        valoApiSkins = requests.Response()
+        valoApiSkins.status_code = 200
+        valoApiSkins._content = b'{"data": []}'
     gameContent = content.get_content()
     seasonID = content.get_latest_season_id(gameContent)
     previousSeasonID = content.get_previous_season_id(gameContent)
     lastGameState = ""
+    pending_match_data = {}
+    pending_match_lock = threading.RLock()
+
+    def queue_match_data(data):
+        with pending_match_lock:
+            pending_match_data.update(data)
+
+    def flush_match_data():
+        with pending_match_lock:
+            if pending_match_data:
+                # Persist first; Riot may publish results well after leaving INGAME.
+                stats.save_data(pending_match_data.copy())
+                pending_match_data.clear()
+                app_state.publish("historyUpdated", {})
+                history_sync.notify()
+
+    def shutdown_monitor():
+        history_sync.stop()
+        recent_stats_sync.stop()
+        try:
+            flush_match_data()
+        except (OSError, ValueError):
+            log("Could not save pending history during shutdown")
+        if rpc is not None:
+            rpc.shutdown()
+
+    atexit.register(shutdown_monitor)
 
     # Cache rank+stats per player for the current match so PREGAME data can be reused in INGAME
     match_player_cache = {
@@ -187,9 +230,12 @@ try:
         # Cache miss -> fetch
         playerRank = rank.get_rank(player_subject, seasonID)
         previousPlayerRank = rank.get_rank(player_subject, previousSeasonID)
-        ppstats = pstats.get_stats(player_subject)
+        # Live/agent-select match details are not final player statistics.
+        # Never substitute another match's numbers for the active match.
+        ppstats = pstats._default_stats() if current_match_id else pstats.get_stats(player_subject)
 
-        if current_match_id and match_player_cache["match_id"] == current_match_id:
+        if (current_match_id and match_player_cache["match_id"] == current_match_id
+                and playerRank.get("statusgood") and previousPlayerRank.get("statusgood")):
             match_player_cache["players"][player_subject] = {
                 "playerRank": dict(playerRank) if isinstance(playerRank, dict) else playerRank,
                 "previousPlayerRank": dict(previousPlayerRank) if isinstance(previousPlayerRank, dict) else previousPlayerRank,
@@ -203,9 +249,23 @@ try:
 
     richConsole = RichConsole()
 
+    def refresh_runtime_settings():
+        global rpc
+        if not cfg.reload_if_changed():
+            return
+        if cfg.get_feature_flag("discord_rpc") and rpc is None:
+            rpc = Rpc(map_urls, gamemodes, colors, log)
+            rpc.set_rpc(presences.get_private_presence(presence) if "presence" in globals() else {})
+        elif not cfg.get_feature_flag("discord_rpc") and rpc is not None:
+            rpc.shutdown()
+            rpc = None
+        Wss.rpc = rpc
+
+    Wss.on_idle = refresh_runtime_settings
     firstTime = True
     firstPrint = True
     while True:
+        refresh_runtime_settings()
         table.clear()
         table.set_default_field_names()
         table.reset_runtime_col_flags()
@@ -225,18 +285,19 @@ try:
             #     asyncio.set_event_loop(loop)
             #     game_state = loop.run_until_complete(Wss.conntect_to_websocket(game_state))
             if firstTime:
-                run = True
-                while run:
+                game_state = "DISCONNECTED"
+                for attempt in range(5):
+                    refresh_runtime_settings()
                     presence = presences.get_presence()
                     private_presence = presences.get_private_presence(presence)
-                    # wait until your own valorant presence is initialized
-                    if private_presence is not None:
-                        if cfg.get_feature_flag("discord_rpc"):
+                    detected_state = presences.get_game_state(presence)
+                    if detected_state is not None:
+                        game_state = detected_state
+                        if rpc is not None:
                             rpc.set_rpc(private_presence)
-                        game_state = presences.get_game_state(presence)
-                        if game_state is not None:
-                            run = False
-                    time.sleep(2)
+                        break
+                    if attempt < 4:
+                        time.sleep(2)
                 log(f"first game state: {game_state}")
             else:
                 loop = asyncio.new_event_loop()
@@ -264,6 +325,13 @@ try:
                 pstats.clear_runtime_cache()
 
         if game_state == "DISCONNECTED":
+            history_sync.set_active_match(None)
+            history_sync.start()
+            flush_match_data()
+            recent_stats_sync.submit({})
+            app_state.publish("disconnected", {})
+            namesClass.clear_cache()
+            rank.invalidate_cached_responses()
             richConsole.print("[yellow]Disconnected from Valorant. Attempting to reconnect...[/yellow]")
             # Loop waits for the Valorant client to respond
             while True:
@@ -283,9 +351,12 @@ try:
 
             richConsole.print("[green]Reconnected successfully! Loading...[/green]")
             
-            Requests.get_headers(refresh=True)
+            if not Requests.get_headers(refresh=True):
+                time.sleep(5)
+                continue
 
             Wss = Ws(Requests.lockfile, Requests, cfg, colors, hide_names, app_state, rpc)
+            Wss.on_idle = refresh_runtime_settings
 
             firstTime = True 
             lastGameState = ""
@@ -296,6 +367,11 @@ try:
 
         if True:
             log(f"getting new {game_state} scoreboard")
+            if game_state != "INGAME":
+                history_sync.set_active_match(None)
+                history_sync.start()
+            if lastGameState == "INGAME" and game_state != "INGAME":
+                flush_match_data()
             lastGameState = game_state
             game_state_dict = {
                 "INGAME": color("In-Game", fore=(241, 39, 39)),
@@ -310,31 +386,23 @@ try:
             
             # get new presence
             presence = presences.get_presence()
-            priv_presence = presences.get_private_presence(presence)
-            
-            # Temp fix: Riot is swapping between nested and flat API structures.
-            party_state = ""
-            if "partyPresenceData" in priv_presence: # Check for nested structure
-                party_state = priv_presence["partyPresenceData"]["partyState"]
-            elif "partyState" in priv_presence: # Check for flattened structure
-                party_state = priv_presence["partyState"]
-            else:
-                # No known structure found, log and fail
-                log("ERROR: Unknown presence API structure in 'main'.")
-                party_state = priv_presence["partyPresenceData"]["partyState"]
-            
-            if (
-                priv_presence["provisioningFlow"] == "CustomGame"
-                or party_state == "CUSTOM_GAME_SETUP"
-            ):
+            priv_presence = presences.get_private_presence(presence) or {}
+            party_presence = priv_presence.get("partyPresenceData")
+            party_presence = party_presence if isinstance(party_presence, dict) else priv_presence
+            match_presence = priv_presence.get("matchPresenceData")
+            match_presence = match_presence if isinstance(match_presence, dict) else priv_presence
+            party_state = party_presence.get("partyState", "")
+            queue_id = priv_presence.get("queueId") or party_presence.get("queueId") or match_presence.get("queueId")
+            provisioning_flow = priv_presence.get("provisioningFlow") or match_presence.get("provisioningFlow")
+            if provisioning_flow == "CustomGame" or party_state == "CUSTOM_GAME_SETUP":
                 gamemode = "Custom Game"
             else:
-                gamemode = gamemodes.get(priv_presence["queueId"])
+                gamemode = gamemodes.get(queue_id)
 
             heartbeat_data = {
                 "time": int(time.time()),
                 "state": game_state,
-                "mode": gamemode or priv_presence.get("queueId") or "Unknown",
+                "mode": gamemode or queue_id or "Unknown",
                 "server": "",
                 "region": Requests.region,
                 "appVersion": version,
@@ -344,9 +412,13 @@ try:
 
             if game_state == "INGAME":
                 coregame_stats = coregame.get_coregame_stats()
-                if coregame_stats == None:
+                if coregame_stats is None:
+                    firstTime = True
+                    time.sleep(2)
                     continue
-                coregame_match_id = coregame.get_coregame_match_id()
+                coregame_match_id = coregame.match_id
+                history_sync.set_active_match(coregame_match_id)
+                history_sync.start()
                 heartbeat_data["matchId"] = coregame_match_id
                 ensure_match_player_cache(coregame_match_id)
                 Players = coregame_stats["Players"]
@@ -379,7 +451,6 @@ try:
                 heartbeat_data["server"] = server
                 if rpc is not None:
                     rpc.set_data({"server": server})
-                presences.wait_for_presence(namesClass.get_players_puuid(Players))
                 names = namesClass.get_names_from_puuids(Players)
                 loadouts_arr = loadoutsClass.get_match_loadouts(
                     coregame_match_id,
@@ -391,6 +462,8 @@ try:
                 )
                 loadouts = loadouts_arr[0]
                 loadouts_data = loadouts_arr[1]
+                for player in Players:
+                    loadouts_data["Players"].setdefault(player["Subject"], {})
                 # with alive_bar(total=len(Players), title='Fetching Players', bar='classic2') as bar:
                 isRange = False
                 playersLoaded = 1
@@ -400,8 +473,9 @@ try:
                 heartbeat_data["mapSplash"] = map_splashes.get(map_name)
                 with richConsole.status("Loading Players...") as status:
                     partyOBJ = menu.get_party_json(
-                        namesClass.get_players_puuid(Players), presence
+                        namesClass.get_players_puuid(Players), presence, partyMembers
                     )
+                    party_labels = menu.get_party_labels(partyOBJ)
                     # log(f"retrieved names dict: {names}")
                     Players.sort(
                         key=lambda Players: Players["PlayerIdentity"].get(
@@ -410,9 +484,6 @@ try:
                         reverse=True,
                     )
                     Players.sort(key=lambda Players: Players["TeamID"], reverse=True)
-                    partyCount = 0
-                    partyNum = 0
-                    partyIcons = {}
                     lastTeamBoolean = False
                     lastTeam = "Red"
 
@@ -483,21 +554,8 @@ try:
                                             }
                                         )
 
-                        party_icon = ""
-                        # set party premade icon
-                        for party in partyOBJ:
-                            if player["Subject"] in partyOBJ[party]:
-                                if party not in partyIcons:
-                                    partyIcons.update(
-                                        {party: PARTYICONLIST[partyCount]}
-                                    )
-                                    # PARTY_ICON
-                                    party_icon = PARTYICONLIST[partyCount]
-                                    partyNum = partyCount + 1
-                                    partyCount += 1
-                                else:
-                                    # PARTY_ICON
-                                    party_icon = partyIcons[party]
+                        partyNum = party_labels.get(player["Subject"], {}).get("partyNumber", 0)
+                        party_icon = PARTYICONLIST[(partyNum - 1) % len(PARTYICONLIST)] if partyNum else ""
                         playerRank, previousPlayerRank, ppstats = get_or_fetch_rank_and_stats(
                             player["Subject"], coregame_match_id
                         )
@@ -648,7 +706,8 @@ try:
                             "puuid": player["Subject"],
                             "name": get_display_player_name(player, names),
                             "streamerMode": player["PlayerIdentity"].get("Incognito", False),
-                            "partyNumber": partyNum if party_icon != "" else 0,
+                            "partyNumber": partyNum,
+                            "partySize": party_labels.get(player["Subject"], {}).get("partySize", 0),
                              "agent": agent_dict.get(player["CharacterID"].lower(), "Unknown"),
                              "rank": playerRank["rank"],
                              "rankIcon": rank_icons.get(playerRank["rank"], {}).get("largeIcon"),
@@ -662,14 +721,12 @@ try:
                              "earnedRR": ppstats["RankedRatingEarned"],
                              "afkPenalty": ppstats["AFKPenalty"],
                              "skin": colors.escape_ansi(skin),
-                            "kd": ppstats["kd"],
+                            "kd": ppstats["kd"], "kills": ppstats.get("kills"), "deaths": ppstats.get("deaths"), "assists": ppstats.get("assists"), "adr": ppstats.get("adr"),
                             "headshotPercentage": ppstats["hs"],
                             "winPercentage": f"{playerRank['wr']} ({playerRank['numberofgames']})",
                             "level": player_level,
                             "agentImgLink": agent_icons.get(str(player.get("CharacterID") or "").lower()),
-                            "team": loadouts_data["Players"][player["Subject"]].get(
-                                "Team", None
-                            ),
+                            "team": player.get("TeamID"),
                             "sprays": loadouts_data["Players"][player["Subject"]].get(
                                 "Sprays", None
                             ),
@@ -684,7 +741,7 @@ try:
                             ),
                         }
 
-                        stats.save_data(
+                        queue_match_data(
                             {
                                 player["Subject"]: {
                                     "name": names[player["Subject"]],
@@ -696,7 +753,7 @@ try:
                                     "rank": playerRank["rank"],
                                     "rr": rr,
                                     "hs": ppstats["hs"],
-                                    "kd": ppstats["kd"],
+                                    "kd": ppstats["kd"], "kills": ppstats.get("kills"), "deaths": ppstats.get("deaths"), "assists": ppstats.get("assists"), "adr": ppstats.get("adr"),
                                     "winRate": playerRank["wr"],
                                     "earnedRR": ppstats["RankedRatingEarned"],
                                     "team": player.get("TeamID"),
@@ -712,7 +769,9 @@ try:
             elif game_state == "PREGAME":
                 already_played_with = []
                 pregame_stats = pregame.get_pregame_stats()
-                if pregame_stats == None:
+                if pregame_stats is None:
+                    firstTime = True
+                    time.sleep(2)
                     continue
                 server = pregame_stats.get("GamePodID", "")
                 heartbeat_data["server"] = server
@@ -722,10 +781,9 @@ try:
                 heartbeat_data["map"] = pregame_map_name
                 heartbeat_data["mapSplash"] = map_splashes.get(pregame_map_name)
                 Players = pregame_stats["AllyTeam"]["Players"]
-                heartbeat_data["ownTeam"] = pregame_stats.get("Teams", [{}])[0].get("TeamID")
-                presences.wait_for_presence(namesClass.get_players_puuid(Players))
+                heartbeat_data["ownTeam"] = pregame_own_team(pregame_stats, Requests.puuid)
                 names = namesClass.get_names_from_puuids(Players)
-                pregame_match_id = pregame_stats.get("ID")
+                pregame_match_id = pregame_stats.get("ID") or pregame.match_id
                 heartbeat_data["matchId"] = pregame_match_id
                 ensure_match_player_cache(pregame_match_id)
                 # temporary until other regions gets fixed?
@@ -734,12 +792,12 @@ try:
                 playersLoaded = 1
                 with richConsole.status("Loading Players...") as status:
                     # with alive_bar(total=len(Players), title='Fetching Players', bar='classic2') as bar:
-                    presence = presences.get_presence()
-                    partyOBJ = menu.get_party_json(
-                        namesClass.get_players_puuid(Players), presence
-                    )
                     partyMembers = menu.get_party_members(Requests.puuid, presence)
                     partyMembersList = [a["Subject"] for a in partyMembers]
+                    partyOBJ = menu.get_party_json(
+                        namesClass.get_players_puuid(Players), presence, partyMembers
+                    )
+                    party_labels = menu.get_party_labels(partyOBJ)
                     # log(f"retrieved names dict: {names}")
                     Players.sort(
                         key=lambda Players: Players["PlayerIdentity"].get(
@@ -747,29 +805,13 @@ try:
                         ),
                         reverse=True,
                     )
-                    partyCount = 0
-                    partyIcons = {}
                     for player in Players:
                         status.update(
                             f"Loading players... [{playersLoaded}/{len(Players)}]"
                         )
                         playersLoaded += 1
-                        party_icon = ""
-
-                        # set party premade icon
-                        for party in partyOBJ:
-                            if player["Subject"] in partyOBJ[party]:
-                                if party not in partyIcons:
-                                    partyIcons.update(
-                                        {party: PARTYICONLIST[partyCount]}
-                                    )
-                                    # PARTY_ICON
-                                    party_icon = PARTYICONLIST[partyCount]
-                                    partyNum = partyCount + 1
-                                else:
-                                    # PARTY_ICON
-                                    party_icon = partyIcons[party]
-                                partyCount += 1
+                        partyNum = party_labels.get(player["Subject"], {}).get("partyNumber", 0)
+                        party_icon = PARTYICONLIST[(partyNum - 1) % len(PARTYICONLIST)] if partyNum else ""
                         playerRank, previousPlayerRank, ppstats = get_or_fetch_rank_and_stats(
                             player["Subject"], pregame_match_id
                         )
@@ -929,7 +971,8 @@ try:
                             "name": get_display_player_name(player, names),
                             "streamerMode": player["PlayerIdentity"].get("Incognito", False),
                             "team": heartbeat_data.get("ownTeam"),
-                            "partyNumber": partyNum if party_icon != "" else 0,
+                            "partyNumber": partyNum,
+                            "partySize": party_labels.get(player["Subject"], {}).get("partySize", 0),
                             "agent": agent_dict.get(player["CharacterID"].lower(), "Unknown"),
                             "agentImgLink": agent_icons.get(str(player.get("CharacterID") or "").lower()),
                             "rank": playerRank["rank"],
@@ -944,7 +987,7 @@ try:
                             "rr": rr,
                             "earnedRR": ppstats["RankedRatingEarned"],
                             "afkPenalty": ppstats["AFKPenalty"],
-                            "kd": ppstats["kd"],
+                            "kd": ppstats["kd"], "kills": ppstats.get("kills"), "deaths": ppstats.get("deaths"), "assists": ppstats.get("assists"), "adr": ppstats.get("adr"),
                             "headshotPercentage": ppstats["hs"],
                             "winPercentage": f"{playerRank['wr']} ({playerRank['numberofgames']})",
                         }
@@ -958,6 +1001,9 @@ try:
                 server = ""
                 already_played_with = []
                 Players = menu.get_party_members(Requests.puuid, presence)
+                party_labels = menu.get_party_labels(menu.get_party_json(
+                    namesClass.get_players_puuid(Players), presence, Players
+                ))
                 names = namesClass.get_names_from_puuids(Players)
                 playersLoaded = 1
                 with richConsole.status("Loading Players...") as status:
@@ -969,10 +1015,10 @@ try:
                         ),
                         reverse=True,
                     )
-                    seen = []
+                    seen = set()
                     for player in Players:
 
-                        if player not in seen:
+                        if player["Subject"] not in seen:
                             status.update(
                                 f"Loading players... [{playersLoaded}/{len(Players)}]"
                             )
@@ -1003,7 +1049,7 @@ try:
                             #     rankStatus = playerRank[1]
                             # playerRank = playerRank["rank"]
 
-                            ppstats = pstats.get_stats(player["Subject"])
+                            ppstats = pstats._default_stats() if os.environ.get("VRY_GUI") == "1" else pstats.get_stats(player["Subject"])
                             hs = ppstats["hs"]
                             kd = ppstats["kd"]
 
@@ -1104,13 +1150,14 @@ try:
                                 "rr": rr,
                                 "earnedRR": ppstats["RankedRatingEarned"],
                                 "afkPenalty": ppstats["AFKPenalty"],
-                                "kd": ppstats["kd"],
+                                "kd": ppstats["kd"], "kills": ppstats.get("kills"), "deaths": ppstats.get("deaths"), "assists": ppstats.get("assists"), "adr": ppstats.get("adr"),
                                 "headshotPercentage": ppstats["hs"],
                                 "winPercentage": f"{playerRank['wr']} ({playerRank['numberofgames']})",
+                                **party_labels.get(player["Subject"], {"partyNumber": 0, "partySize": 0}),
                             }
 
                             # bar()
-                    seen.append(player["Subject"])
+                        seen.add(player["Subject"])
             if (title := game_state_dict.get(game_state)) is None:
                 # program_exit(1)
                 time.sleep(9)
@@ -1152,6 +1199,7 @@ try:
 
                 table.set_caption(f"VALORANT rank yoinker v{version}")
                 app_state.publish("heartbeat", heartbeat_data)
+                recent_stats_sync.submit(heartbeat_data)
                 table.display()
                 firstPrint = False
 
@@ -1170,8 +1218,7 @@ try:
             # time.sleep(cfg.cooldown)
             pass
 except KeyboardInterrupt:
-    # lame implementation of fast ctrl+c exit
-    os._exit(0)
+    pass
 except:
     log(traceback.format_exc())
     app_state.set_error(traceback.format_exc())
@@ -1185,3 +1232,12 @@ except:
     if os.environ.get("VRY_GUI") != "1":
         input("press enter to exit...\n")
         os._exit(1)
+finally:
+    if "shutdown_monitor" in globals():
+        shutdown_monitor()
+        atexit.unregister(shutdown_monitor)
+    else:
+        if "history_sync" in globals():
+            history_sync.stop()
+        if "recent_stats_sync" in globals():
+            recent_stats_sync.stop()

@@ -1,42 +1,122 @@
 import os
 import time
 import json
+import shutil
+import tempfile
+import threading
+
+from src.party import history_party_labels, normalize_party_id
+
 
 class Stats:
+    _lock = threading.RLock()
+    STAT_FIELDS = ("hs", "kd", "kills", "deaths", "assists", "adr")
+
     def __init__(self):
-        pass
+        self.path = os.path.join(os.getenv("APPDATA"), "vry", "stats.json")
+
+    @staticmethod
+    def _is_number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _read_data(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            if not isinstance(data, dict) or not all(isinstance(entries, list) for entries in data.values()):
+                raise ValueError("Invalid history format")
+            return data
+        except FileNotFoundError:
+            return {}
+
+    def _write_data(self, data):
+        directory = os.path.dirname(self.path)
+        os.makedirs(directory, exist_ok=True)
+        # Preserve the original before the first mutation, including backfills.
+        backup = self.path + ".bak"
+        if os.path.exists(self.path) and not os.path.exists(backup):
+            shutil.copy2(self.path, backup)
+        fd, temporary = tempfile.mkstemp(prefix="stats-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(data, file)
+            os.replace(temporary, self.path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def save_data(self, data):
-        # path = os.path.join(os.getenv('APPDATA'), R'vry\stats.json')
-        try:
-            os.mkdir(os.path.join(os.getenv('APPDATA'), "vry"))
-        except FileExistsError:
-            pass
-        try:
-            with open(os.path.join(os.getenv('APPDATA'), "vry/stats.json"), "r") as f:
-                original_data = json.load(f)
-        except (FileNotFoundError, json.decoder.JSONDecodeError):
-            original_data = {}
+        with self._lock:
+            original = self._read_data()
+            for puuid, entry in data.items():
+                entries = original.setdefault(puuid, [])
+                existing = next((item for item in entries if entry.get("match_id") and item.get("match_id") == entry["match_id"]), None)
+                if existing is None:
+                    entries.append(entry)
+            self._write_data(original)
 
-        updated_data = original_data.copy()
-        for puuid in data.keys():
-            if original_data.get(puuid) is None:
-                updated_data.update({puuid: [data[puuid]]})
-            else:
-                updated_data[puuid].append(data[puuid])
-        
-        # updated_data.update(data)
-        # print(updated_data)
-
-        with open(os.path.join(os.getenv('APPDATA'), "vry/stats.json"), "w") as f:
-            json.dump(updated_data, f)
-    
     def read_data(self):
-        try:
-            with open(os.path.join(os.getenv('APPDATA'), "vry/stats.json"), "r") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.decoder.JSONDecodeError):
-            return {}
+        with self._lock:
+            try:
+                return self._read_data()
+            except (OSError, ValueError):
+                return {}
+
+    def get_incomplete_matches(self, limit=30):
+        matches = {}
+        data = self.read_data()
+        recent = {}
+        for entries in data.values():
+            for entry in entries:
+                match_id = entry.get("match_id")
+                if match_id:
+                    recent[match_id] = max(recent.get(match_id, 0), entry.get("epoch", 0))
+        party_candidates = set(sorted(recent, key=recent.get, reverse=True)[:limit])
+        for puuid, entries in data.items():
+            for entry in entries:
+                match_id = entry.get("match_id")
+                needs_stats = not entry.get("statsResolved") and any(
+                    not self._is_number(entry.get(field)) for field in self.STAT_FIELDS
+                )
+                needs_party = match_id in party_candidates and entry.get("partyResolved") is not True
+                if match_id and (needs_stats or needs_party):
+                    match = matches.setdefault(match_id, {"epoch": 0, "players": set()})
+                    match["epoch"] = max(match["epoch"], entry.get("epoch", 0))
+                    match["players"].add(puuid)
+        return dict(sorted(matches.items(), key=lambda item: item[1]["epoch"], reverse=True)[:limit])
+
+    def update_match_stats(self, match_id, players):
+        changed = False
+        with self._lock:
+            data = self._read_data()
+            for puuid, values in players.items():
+                for entry in data.get(puuid, []):
+                    if entry.get("match_id") != match_id:
+                        continue
+                    for field in self.STAT_FIELDS:
+                        value = values.get(field)
+                        if self._is_number(value) and entry.get(field) != value:
+                            entry[field] = value
+                            changed = True
+                    if values.get("partyResolved") is True:
+                        party_id = normalize_party_id(values.get("partyId"))
+                        if party_id is None and entry.get("partyResolved") is True:
+                            party_id = normalize_party_id(entry.get("partyId"))
+                        if entry.get("partyId") != party_id or "partyId" not in entry:
+                            entry["partyId"] = party_id
+                            changed = True
+                        if entry.get("partyResolved") is not True:
+                            entry["partyResolved"] = True
+                            changed = True
+                    # Missing hit data is legitimate in some modes. Do not retry
+                    # forever once all core player totals have been published.
+                    resolved = all(self._is_number(values.get(field)) for field in ("kills", "deaths", "assists"))
+                    if resolved and not entry.get("statsResolved"):
+                        entry["statsResolved"] = True
+                        changed = True
+            if changed:
+                self._write_data(data)
+        return changed
 
     def get_history(self, limit=30):
         matches = {}
@@ -78,12 +158,25 @@ class Stats:
                     "rr": entry.get("rr", 0),
                     "hs": entry.get("hs"),
                     "kd": entry.get("kd"),
+                    "kills": entry.get("kills"),
+                    "deaths": entry.get("deaths"),
+                    "assists": entry.get("assists"),
+                    "adr": entry.get("adr"),
                     "winRate": entry.get("winRate"),
                     "earnedRR": entry.get("earnedRR"),
                     "team": entry.get("team"),
                     "epoch": entry.get("epoch", 0),
+                    "partyId": normalize_party_id(entry.get("partyId")),
+                    "partyResolved": entry.get("partyResolved") is True,
+                    "partySource": "match-results" if entry.get("partyResolved") is True else None,
+                    "partyNumber": 0,
+                    "partySize": 0,
                 }
-        return sorted(matches.values(), key=lambda match: match["epoch"], reverse=True)[:limit]
+        history = sorted(matches.values(), key=lambda match: match["epoch"], reverse=True)[:limit]
+        for match in history:
+            for puuid, label in history_party_labels(match["players"]).items():
+                match["players"][puuid].update(label)
+        return history
 
     def get_encounters(self):
         encounters = {}
@@ -109,10 +202,8 @@ class Stats:
         return sorted(entries, key=lambda entry: entry.get("epoch", 0), reverse=True)[:limit]
 
     def clear_data(self):
-        directory = os.path.join(os.getenv('APPDATA'), "vry")
-        os.makedirs(directory, exist_ok=True)
-        with open(os.path.join(directory, "stats.json"), "w") as file:
-            json.dump({}, file)
+        with self._lock:
+            self._write_data({})
 
     def convert_time(self, s):
         s = int(s)

@@ -5,38 +5,57 @@ class Content():
         self.Requests = Requests
         self.log = log
         self.content = {}
+        self._catalogs = {}
+
+    def _public_data(self, resource):
+        if resource not in self._catalogs:
+            try:
+                response = requests.get(f"https://valorant-api.com/v1/{resource}", timeout=(3, 10))
+                response.raise_for_status()
+                payload = response.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(data, list):
+                    raise ValueError("Invalid catalog")
+                self._catalogs[resource] = [item for item in data if isinstance(item, dict)]
+            except (requests.RequestException, ValueError):
+                self.log(f"Reference catalog unavailable: {resource}")
+                return []
+        return self._catalogs[resource]
 
     def get_content(self):
-        self.content = self.Requests.fetch("custom", f"https://shared.{self.Requests.region}.a.pvp.net/content-service/v3/content", "get")
+        data = self.Requests.fetch("custom", f"https://shared.{self.Requests.region}.a.pvp.net/content-service/v3/content", "get")
+        if isinstance(data, dict) and isinstance(data.get("Seasons"), list):
+            self.content = data
         return self.content
 
+    @staticmethod
+    def _seasons(content):
+        seasons = content.get("Seasons") if isinstance(content, dict) else None
+        return [season for season in seasons if isinstance(season, dict)] if isinstance(seasons, list) else []
+
     def get_latest_season_id(self, content):
-        for season in content["Seasons"]:
-            if season["IsActive"] and season["Type"] == "act":
-                self.log(f"retrieved season id: {season['ID']}")
-                return season["ID"]
+        for season in self._seasons(content):
+            if season.get("IsActive") and season.get("Type") == "act":
+                return season.get("ID")
 
     def get_previous_season_id(self, content):
-        currentseason = []
-        for season in content["Seasons"]:
-            if season["IsActive"] and season["Type"] == "act":
-                currentseason = season
-
-        for season in content["Seasons"]:
-            if currentseason["StartTime"] == season["EndTime"] and season["Type"] == "act":
-                self.log(f"retrieved previous season id: {season['ID']}")
-                return season["ID"]
+        seasons = self._seasons(content)
+        current = next((season for season in seasons if season.get("IsActive") and season.get("Type") == "act"), {})
+        if not current.get("StartTime"):
+            return None
+        for season in seasons:
+            if current["StartTime"] == season.get("EndTime") and season.get("Type") == "act":
+                return season.get("ID")
         return None
 
     def get_all_agents(self):
-        self.agents_data = requests.get(
-            "https://valorant-api.com/v1/agents?isPlayableCharacter=true"
-        ).json()["data"]
+        self.agents_data = self._public_data("agents?isPlayableCharacter=true")
         agent_dict = {}
         agent_dict.update({None: None})
         agent_dict.update({"": ""})
         for agent in self.agents_data:
-            agent_dict.update({agent['uuid'].lower(): agent['displayName']})
+            if isinstance(agent.get("uuid"), str) and isinstance(agent.get("displayName"), str):
+                agent_dict[agent["uuid"].lower()] = agent["displayName"]
         self.log(f"retrieved agent dict: {agent_dict}")
         return agent_dict
 
@@ -45,7 +64,7 @@ class Content():
             self.get_all_agents()
         return {
             agent["uuid"].lower(): agent.get("displayIcon")
-            for agent in self.agents_data
+            for agent in self.agents_data if isinstance(agent.get("uuid"), str)
         }
 
     def get_all_maps(self):
@@ -53,13 +72,14 @@ class Content():
         Requests data and assets of all maps.
         :return: JSON of all map information.
         """
-        return requests.get("https://valorant-api.com/v1/maps").json()
+        return {"data": self._public_data("maps")}
 
     def get_map_urls(self, maps) -> dict:
         map_dict = {}
         map_dict.update({None: None})
         for Vmap in maps["data"]:
-            map_dict.update({Vmap['mapUrl'].lower(): Vmap['displayName']})
+            if isinstance(Vmap.get("mapUrl"), str) and isinstance(Vmap.get("displayName"), str):
+                map_dict[Vmap["mapUrl"].lower()] = Vmap["displayName"]
         self.log(f"retrieved map dict: {map_dict}")
         return map_dict
 
@@ -72,16 +92,13 @@ class Content():
         val_map_dict = {}
         val_map_dict.update({None: None})
         for val_map in val_maps["data"]:
-            val_map_dict.update({val_map['displayName']: val_map['splash']})
+            if isinstance(val_map.get("displayName"), str):
+                val_map_dict[val_map["displayName"]] = val_map.get("splash")
         return val_map_dict
 
     def get_rank_icons(self):
         try:
-            response = requests.get(
-                "https://valorant-api.com/v1/competitivetiers", timeout=15
-            )
-            response.raise_for_status()
-            tier_sets = response.json().get("data", [])
+            tier_sets = self._public_data("competitivetiers")
             latest_tiers = max(
                 (tier_set.get("tiers", []) for tier_set in tier_sets),
                 key=len,
@@ -94,8 +111,8 @@ class Content():
                 }
                 for tier in latest_tiers
             }
-        except (requests.RequestException, ValueError, KeyError) as error:
-            self.log(f"Failed to load competitive tier icons: {error}")
+        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
+            self.log("Failed to load competitive tier icons")
             return {}
 
     def get_act_episode_from_act_id(self, act_id):
@@ -173,24 +190,26 @@ class Content():
 
         # Process seasons to find act and episode
         act_found = False
-        episode = []
-        episode = self.content["Seasons"][0]
-        for season in self.content["Seasons"]:
+        seasons = self._seasons(self.content)
+        if not seasons or not isinstance(act_id, str):
+            return final
+        episode = seasons[0]
+        for season in seasons:
             # Check for matching act ID
-            if season["ID"].lower() == act_id.lower():
-                act_num = parse_season_number(season["Name"])
+            if str(season.get("ID", "")).lower() == act_id.lower():
+                act_num = parse_season_number(season.get("Name"))
                 if act_num is not None:
                     final["act"] = act_num
                 act_found = True
         
             # Find the first episode after the act
-            if act_found and season["Type"] == "episode":
-                episode_num = parse_season_number(episode["Name"])
+            if act_found and season.get("Type") == "episode":
+                episode_num = parse_season_number(episode.get("Name"))
                 if episode_num is not None:
                     final["episode"] = episode_num
                 break
 
-            if season["Type"] == "episode":
+            if season.get("Type") == "episode":
                 episode = season
 
         return final

@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -10,24 +11,46 @@ import flet as ft
 
 from src.app_state import app_state
 from src.constants import DEFAULT_CONFIG, version
+from src.config import config_path, save_config
 from src.stats import Stats
+from src.match_context import starting_side
+from src.stat_format import format_stat, recent_stats_caption, STATS_PENDING
 from src.system_notifications import show_system_notification
 
 
-BACKGROUND = "#080B10"
-SURFACE = ft.Colors.with_opacity(0.82, "#11151D")
-SURFACE_ALT = ft.Colors.with_opacity(0.76, "#171C26")
-BORDER = "#252C38"
-TEXT = "#F4F1EA"
-MUTED = "#8C95A5"
+BACKGROUND = "#0A0D12"
+SURFACE = ft.Colors.with_opacity(0.94, "#121720")
+SURFACE_ALT = ft.Colors.with_opacity(0.92, "#19212C")
+BORDER = "#283240"
+PANEL = "#10161F"
+PANEL_RAISED = "#19212C"
+GRID = ft.Colors.with_opacity(0.025, "#FFFFFF")
+TEXT = "#E9EEF5"
+MUTED = "#98A5B6"
 ACCENT = "#FF4655"
-ALLY = "#49A8FF"
-ENEMY = "#FF5E6B"
+ALLY = "#79B5EF"
+ENEMY = "#DF8994"
+SUCCESS = "#67C79A"
+WARNING = "#D9B975"
+SELF_SURFACE = "#142130"
+PARTY_COLORS = ("#66D9EF", "#FFD166", "#B9A0FF", "#79E2A7", "#FF9EC4", "#FFB477", "#A8D8FF", "#DBE685", "#E0B3FF", "#8FE1D0")
+
+
+def _hud_surface(active=False, accent=ACCENT):
+    return {
+        "bgcolor": ft.Colors.with_opacity(0.18, accent) if active else PANEL,
+        "border": ft.border.all(1, ft.Colors.with_opacity(0.60, accent) if active else BORDER),
+        "border_radius": 12,
+    }
 
 
 def _asset_path(relative_path):
     root = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
     return str(root / "assets" / relative_path)
+
+
+def _config_path():
+    return config_path()
 
 
 def _map_name(value):
@@ -110,8 +133,8 @@ def _rank_badge(tier, suffix=None):
     return ft.Row(
         spacing=4,
         tight=True,
-        controls=[
-            ft.Container(
+             controls=[
+                 ft.Container(
                 width=24,
                 height=24,
                 border_radius=7,
@@ -180,6 +203,27 @@ def _secondary_rank_text(tier, suffix=None):
     return ft.Row(spacing=5, tight=True, controls=controls)
 
 
+def _party_badge(player):
+    number = player.get("partyNumber")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return ft.Container(visible=False)
+    color = PARTY_COLORS[(number - 1) % len(PARTY_COLORS)]
+    tooltip = f"Пати {number}: одинаковый номер обозначает игроков одной пати."
+    if player.get("partySource") == "match-results":
+        tooltip += " Подтверждено по результатам этого матча."
+    size = player.get("partySize")
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        tooltip += f" Участников этой пати в матче: {size}."
+    return ft.Container(
+        padding=ft.padding.symmetric(horizontal=5, vertical=2),
+        border_radius=5,
+        bgcolor=ft.Colors.with_opacity(0.18, color),
+        border=ft.border.all(1, ft.Colors.with_opacity(0.65, color)),
+        tooltip=tooltip,
+        content=ft.Text(f"ПАТИ {number}", size=10, color=color, weight=ft.FontWeight.BOLD, no_wrap=True),
+    )
+
+
 class ValorantApp:
     def __init__(self, page):
         self.page = page
@@ -194,15 +238,20 @@ class ValorantApp:
         self.feature_settings = self._load_feature_settings()
         self.stats_store = Stats()
         self.history = []
+        self.history_mode = "Все"
+        self.settings_category = "Отображение"
         self.encounters = {}
         self.last_game_state = None
         self.notification_keys = set()
         self.player_panel_open = False
+        self.history_match_id = None
         self._last_view_index = None
         self._navigation_needs_update = True
         self._mounted = False
         self.scroll_positions = {}
         self.scroll_controls = {}
+        self._scroll_restore_tokens = {}
+        self._scroll_contexts = {}
         self.shimmer_controls = []
         self.last_revision = -1
         self.snapshot = app_state.snapshot()
@@ -230,8 +279,8 @@ class ValorantApp:
             width=620,
             height=620,
             border_radius=310,
-            opacity=0.32,
-            gradient=ft.RadialGradient(colors=["#61232D", ft.Colors.with_opacity(0, "#61232D")]),
+            opacity=0.14,
+            gradient=ft.RadialGradient(colors=["#293447", ft.Colors.with_opacity(0, "#293447")]),
             animate_position=ft.Animation(8000, ft.AnimationCurve.EASE_IN_OUT),
             animate_opacity=ft.Animation(8000, ft.AnimationCurve.EASE_IN_OUT),
         )
@@ -241,8 +290,8 @@ class ValorantApp:
             width=720,
             height=720,
             border_radius=360,
-            opacity=0.24,
-            gradient=ft.RadialGradient(colors=["#173E59", ft.Colors.with_opacity(0, "#173E59")]),
+            opacity=0.12,
+            gradient=ft.RadialGradient(colors=["#1F3547", ft.Colors.with_opacity(0, "#1F3547")]),
             animate_position=ft.Animation(9000, ft.AnimationCurve.EASE_IN_OUT),
             animate_opacity=ft.Animation(9000, ft.AnimationCurve.EASE_IN_OUT),
         )
@@ -275,7 +324,7 @@ class ValorantApp:
             top=0,
             bottom=0,
             padding=18,
-            bgcolor="#0C1016",
+            bgcolor=BACKGROUND,
             border=ft.border.only(left=ft.BorderSide(1, BORDER)),
             shadow=ft.BoxShadow(blur_radius=30, color=ft.Colors.with_opacity(0.55, "#000000"), offset=ft.Offset(-8, 0)),
             animate_position=ft.Animation(260, ft.AnimationCurve.EASE_OUT_CUBIC),
@@ -309,10 +358,10 @@ class ValorantApp:
             gradient=ft.LinearGradient(
                 begin=ft.alignment.top_center,
                 end=ft.alignment.bottom_center,
-                colors=["#151016", "#0B1017", "#090D13", "#0D1119"],
+                colors=["#141B25", "#10161F", "#0D121A", "#10161F"],
                 stops=[0, 0.32, 0.72, 1],
             ),
-            border=ft.border.only(right=ft.BorderSide(1, BORDER)),
+            border=ft.border.only(right=ft.BorderSide(1, "#303846")),
             clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
             content=self._navigation_content(),
         )
@@ -334,7 +383,7 @@ class ValorantApp:
                                 gradient=ft.LinearGradient(
                                     begin=ft.alignment.top_left,
                                     end=ft.alignment.bottom_right,
-                                    colors=["#070A0F", "#0B1018", "#100B10"],
+                                    colors=[BACKGROUND, "#10161F", BACKGROUND],
                                 ),
                             ),
                             self.ambient_blob_a,
@@ -367,46 +416,86 @@ class ValorantApp:
 
     def _scrollable_column(self, view_id, controls, spacing=10, enabled=True, list_view=False):
         control_type = ft.ListView if list_view else ft.Column
-        kwargs = {
-            "key": f"scroll-{view_id}",
-            "expand": True,
-            "spacing": spacing,
-            "controls": controls,
-            "on_scroll": lambda event, key=view_id: self._remember_scroll(key, event),
-            "on_scroll_interval": 40,
-        }
-        if list_view:
-            kwargs["auto_scroll"] = False
-        else:
-            kwargs["scroll"] = ft.ScrollMode.HIDDEN if enabled else None
-        column = control_type(**kwargs)
+        column = self.scroll_controls.get(view_id)
+        if isinstance(column, control_type):
+            column.controls = controls
+            column.spacing = spacing
+            if not list_view:
+                column.scroll = ft.ScrollMode.HIDDEN if enabled else None
+            return column
+        column = control_type(
+            key=f"scroll-{view_id}", expand=True, spacing=spacing, controls=controls,
+            auto_scroll=False, on_scroll_interval=10,
+        )
+        if not list_view:
+            column.scroll = ft.ScrollMode.HIDDEN if enabled else None
+        column.on_scroll = lambda event: self._remember_scroll(view_id, event, column)
         self.scroll_controls[view_id] = column
         return column
 
-    def _remember_scroll(self, view_id, event):
+    def _scroll_view_active(self, view_id):
+        if view_id in {"history-detail", "player-detail"}:
+            return self.player_panel_open and view_id == ("history-detail" if self.history_match_id else "player-detail")
+        return view_id == {0: "match", 1: "history", 2: "diagnostics", 3: "account", 4: "settings", 5: "skins"}.get(self.selected_view)
+
+    def _remember_scroll(self, view_id, event, control=None):
+        if control is not None and self.scroll_controls.get(view_id) is not control:
+            return
+        if not self._scroll_view_active(view_id):
+            return
+        event_type = getattr(event, "event_type", None)
+        # Layout metrics are not user input and can report zero during mounting.
+        if event_type == "metrics":
+            return
+        self._scroll_restore_tokens[view_id] = object()
         pixels = getattr(event, "pixels", None)
-        if pixels is not None:
+        if pixels is not None and format_stat(pixels) != "—":
             self.scroll_positions[view_id] = max(0, float(pixels))
 
-    async def _restore_scroll(self, view_id):
-        for delay in (0.04, 0.16, 0.35):
-            await asyncio.sleep(delay)
-            control = self.scroll_controls.get(view_id)
-            offset = self.scroll_positions.get(view_id, 0)
-            if control is not None and offset > 0:
-                try:
-                    control.scroll_to(offset=offset, duration=0)
-                except AssertionError:
-                    pass
+    def _schedule_scroll_restore(self, view_id):
+        control = self.scroll_controls.get(view_id)
+        if control is None or not self._scroll_view_active(view_id):
+            return
+        token = object()
+        self._scroll_restore_tokens[view_id] = token
+        offset = self.scroll_positions.get(view_id, 0)
+        if offset > 0:
+            self.page.run_task(self._restore_scroll, view_id, control, token, offset)
+
+    async def _restore_scroll(self, view_id, control, token, offset):
+        await asyncio.sleep(0.05)
+        if (self._scroll_restore_tokens.get(view_id) is not token
+                or self.scroll_controls.get(view_id) is not control
+                or not self._scroll_view_active(view_id)):
+            return
+        try:
+            control.scroll_to(offset=offset, duration=0)
+        except AssertionError:
+            pass
+
+    def _set_scroll_context(self, view_id, context):
+        if self._scroll_contexts.get(view_id) != context:
+            self._scroll_contexts[view_id] = context
+            self.scroll_positions[view_id] = 0
+            self._scroll_restore_tokens[view_id] = object()
+            self.scroll_controls.pop(view_id, None)
 
     def _viewport_width(self):
         return getattr(self.page, "width", None) or self.page.window.width or 0
 
     def _handle_resize(self, _):
         wide_layout = self._viewport_width() >= 1200
+        compact_navigation = self._viewport_width() < 1320
+        self.navigation.width = 76 if compact_navigation else 192
+        self.navigation.padding = ft.padding.symmetric(horizontal=8 if compact_navigation else 12, vertical=16)
+        for item in self.nav_items:
+            item.padding = ft.padding.symmetric(horizontal=8 if compact_navigation else 12)
+            item.content.controls[-1].visible = not compact_navigation
         if wide_layout != self._wide_team_layout:
             self._wide_team_layout = wide_layout
             self.render()
+        else:
+            self.navigation.update()
 
     def _title_bar(self):
         drag_area = ft.WindowDragArea(
@@ -469,6 +558,7 @@ class ValorantApp:
             self._nav_item(2, ft.Icons.MONITOR_HEART_ROUNDED, "Диагностика"),
             self._nav_item(3, ft.Icons.ACCOUNT_CIRCLE_ROUNDED, "Аккаунт"),
             self._nav_item(4, ft.Icons.TUNE_ROUNDED, "Настройки"),
+            self._nav_item(5, ft.Icons.AUTO_AWESOME_ROUNDED, "Скины"),
         ]
         navigation_column = ft.Column(
             expand=True,
@@ -484,6 +574,7 @@ class ValorantApp:
                     ),
                 ),
                 *self.nav_items[:4],
+                self.nav_items[5],
                 ft.Container(expand=True),
                 self.nav_items[4],
                 self.status_panel,
@@ -501,8 +592,8 @@ class ValorantApp:
     def _update_navigation_selection(self):
         for index, item in enumerate(self.nav_items):
             selected = self.selected_view == index
-            item.bgcolor = "#26171C" if selected else None
-            item.border = ft.border.all(1, "#4B2028" if selected else "#0C1016")
+            item.bgcolor = ft.Colors.with_opacity(0.18, ACCENT) if selected else ft.Colors.TRANSPARENT
+            item.border = ft.border.only(left=ft.BorderSide(2, ACCENT if selected else ft.Colors.TRANSPARENT))
             stripe, icon, label = item.content.controls
             stripe.bgcolor = ACCENT if selected else ft.Colors.TRANSPARENT
             stripe.shadow = ft.BoxShadow(blur_radius=9, color=ft.Colors.with_opacity(0.62, ACCENT)) if selected else None
@@ -520,8 +611,8 @@ class ValorantApp:
             padding=ft.padding.symmetric(horizontal=12),
             margin=ft.margin.only(bottom=6),
             border_radius=10,
-            bgcolor="#26171C" if selected else None,
-            border=ft.border.all(1, "#4B2028" if selected else "#0C1016"),
+            bgcolor=ft.Colors.with_opacity(0.18, ACCENT) if selected else ft.Colors.TRANSPARENT,
+            border=ft.border.only(left=ft.BorderSide(2, ACCENT if selected else ft.Colors.TRANSPARENT)),
             on_click=lambda _, value=index: self.change_view(value),
             content=ft.Row(
                 spacing=9,
@@ -540,6 +631,9 @@ class ValorantApp:
         )
 
     def change_view(self, index):
+        if index == self.selected_view:
+            return
+        self._scroll_restore_tokens.clear()
         self._close_player_panel(update=False)
         self.selected_view = index
         if index == 1:
@@ -548,37 +642,72 @@ class ValorantApp:
         self.render()
 
     async def refresh_loop(self):
+        last_diagnostics_refresh = time.monotonic()
         while True:
-            snapshot = app_state.snapshot()
-            if snapshot["revision"] != self.last_revision:
+            if app_state.get_revision() != self.last_revision:
+                snapshot = app_state.snapshot()
+                history_changed = snapshot.get("history_revision") != self.snapshot.get("history_revision")
+                previous_heartbeat = self.snapshot.get("heartbeat") or {}
                 self.snapshot = snapshot
                 self.last_revision = snapshot["revision"]
                 self._handle_notifications(snapshot)
-                if self.selected_view in {1, 2, 3, 4}:
-                    await asyncio.sleep(0.75)
-                    continue
-                if self.player_panel_open:
-                    self.status_text.value = str(snapshot.get("status", "Starting")).upper()
-                    self.status_text.update()
-                    self.status_dot.update()
-                    self.status_panel.update()
-                else:
+                if history_changed:
+                    self._refresh_history()
+                    if self.selected_view == 1:
+                        self.render()
+                        if self.player_panel_open and self.history_match_id:
+                            match = next((item for item in self.history if item["match_id"] == self.history_match_id), None)
+                            if match:
+                                self._show_history_match(match)
+                if self.selected_view == 2:
                     self.render()
+                    last_diagnostics_refresh = time.monotonic()
+                elif self.selected_view == 3:
+                    self.render()
+                elif self.selected_view not in {1, 4}:
+                    if self.selected_view == 0 and self.player_panel_open and not self.history_match_id:
+                        heartbeat = snapshot.get("heartbeat") or {}
+                        selected = getattr(self, "selected_player", None) or {}
+                        current = (heartbeat.get("players") or {}).get(selected.get("puuid"))
+                        context_changed = any(
+                            heartbeat.get(key) != previous_heartbeat.get(key)
+                            for key in ("matchId", "puuid", "state")
+                        )
+                        if context_changed or not current:
+                            self._close_player_panel()
+                        elif current != selected:
+                            self._show_player_card(current)
+                    if self.player_panel_open:
+                        status = snapshot.get("status", "Starting")
+                        color = self._status_color(status, bool(snapshot.get("error")))
+                        self.status_text.value = str(status).upper()
+                        self.status_text.color = color
+                        self.status_dot.bgcolor = color
+                        self.status_panel.bgcolor = ft.Colors.with_opacity(0.10, color)
+                        self.status_panel.border = ft.border.all(1, ft.Colors.with_opacity(0.32, color))
+                        self.status_text.update()
+                        self.status_dot.update()
+                        self.status_panel.update()
+                    else:
+                        self.render()
+            if self.selected_view == 2 and time.monotonic() - last_diagnostics_refresh >= 5:
+                self.render()
+                last_diagnostics_refresh = time.monotonic()
             await asyncio.sleep(0.75)
 
     async def _ambient_loop(self):
         alternate = False
         while True:
             await asyncio.sleep(8)
-            if self.selected_view in {1, 2, 3, 4}:
+            if self.selected_view in {1, 2, 3, 4, 5}:
                 continue
             alternate = not alternate
             self.ambient_blob_a.left = 80 if alternate else -180
             self.ambient_blob_a.top = -80 if alternate else -220
-            self.ambient_blob_a.opacity = 0.22 if alternate else 0.32
+            self.ambient_blob_a.opacity = 0.10 if alternate else 0.14
             self.ambient_blob_b.right = 80 if alternate else -160
             self.ambient_blob_b.bottom = -120 if alternate else -260
-            self.ambient_blob_b.opacity = 0.32 if alternate else 0.24
+            self.ambient_blob_b.opacity = 0.16 if alternate else 0.12
             try:
                 self.ambient_blob_a.update()
                 self.ambient_blob_b.update()
@@ -589,6 +718,8 @@ class ValorantApp:
         bright = False
         while True:
             await asyncio.sleep(0.7)
+            if self.selected_view != 0 or not self.shimmer_controls:
+                continue
             bright = not bright
             for index, control in enumerate(self.shimmer_controls):
                 control.opacity = (0.92 if bright else 0.42) - min(index * 0.05, 0.25)
@@ -792,6 +923,8 @@ class ValorantApp:
             view = self._diagnostics_view()
         elif self.selected_view == 3:
             view = self._account_view()
+        elif self.selected_view == 5:
+            view = self._skins_view()
         else:
             view = self._settings_view()
         initial_render = self._last_view_index is None
@@ -799,7 +932,7 @@ class ValorantApp:
         if initial_render:
             self._last_view_index = self.selected_view
         view_wrapper = ft.Container(
-            key=f"view-{self.selected_view}-{status}",
+            key=f"view-{self.selected_view}",
             content=view,
             padding=ft.padding.only(right=12),
             expand=True,
@@ -808,6 +941,21 @@ class ValorantApp:
             animate_opacity=ft.Animation(260, ft.AnimationCurve.EASE_OUT),
             animate_offset=ft.Animation(300, ft.AnimationCurve.EASE_OUT_CUBIC),
         )
+        if not initial_render and not reveal_view:
+            previous_wrapper = self.view_switcher.content
+            previous_view = previous_wrapper.content
+            if (isinstance(view, ft.Column) and isinstance(previous_view, ft.Column)
+                    and view is not previous_view
+                    and any(control in view.controls and control in previous_view.controls
+                            for control in self.scroll_controls.values())):
+                previous_view.controls = view.controls
+                previous_view.spacing = view.spacing
+                previous_view.alignment = view.alignment
+                view = previous_view
+            previous_wrapper.content = view
+            previous_wrapper.opacity = 1
+            previous_wrapper.offset = ft.Offset(0, 0)
+            view_wrapper = previous_wrapper
         self.view_switcher.content = view_wrapper
         self.content.content = self.view_switcher
         full_update = not self._mounted or self._navigation_needs_update
@@ -824,9 +972,9 @@ class ValorantApp:
             except AssertionError:
                 # Test pages and a just-mounted Flet session may not expose child controls yet.
                 self.page.update()
-        scroll_id = {0: "match", 1: "history", 2: "diagnostics", 3: "account", 4: "settings"}.get(self.selected_view)
-        if scroll_id:
-            self.page.run_task(self._restore_scroll, scroll_id)
+        scroll_id = {0: "match", 1: "history", 2: "diagnostics", 3: "account", 4: "settings", 5: "skins"}.get(self.selected_view)
+        if scroll_id and (initial_render or reveal_view):
+            self._schedule_scroll_restore(scroll_id)
         if reveal_view:
             self._last_view_index = self.selected_view
             self.page.run_task(self._reveal_view, view_wrapper)
@@ -839,11 +987,11 @@ class ValorantApp:
         if has_error or status == "Error":
             return ENEMY
         return {
-            "INGAME": "#4BC487",
-            "PREGAME": "#E6C24F",
+            "INGAME": SUCCESS,
+            "PREGAME": WARNING,
             "MENUS": ALLY,
-            "Connecting": ACCENT,
-            "Launching VALORANT": "#E6C24F",
+            "Connecting": MUTED,
+            "Launching VALORANT": WARNING,
             "Waiting for VALORANT": MUTED,
         }.get(status, ACCENT)
 
@@ -864,38 +1012,52 @@ class ValorantApp:
             panel.update()
             await asyncio.sleep(0.09)
 
-    def _load_settings(self):
-        settings = dict(DEFAULT_CONFIG.get("table", {}))
+    def _load_settings_section(self, section):
+        settings = dict(DEFAULT_CONFIG.get(section, {}))
         try:
-            with open("config.json", "r", encoding="utf-8") as config_file:
-                settings.update(json.load(config_file).get("table", {}))
-        except (OSError, json.JSONDecodeError):
+            with open(_config_path(), "r", encoding="utf-8") as config_file:
+                config = json.load(config_file)
+            values = config.get(section) if isinstance(config, dict) else None
+            if isinstance(values, dict):
+                for key, default in settings.items():
+                    value = values.get(key, default)
+                    if isinstance(default, bool) and isinstance(value, bool):
+                        settings[key] = value
+                    elif key == "rank_icon_style" and value in ("official", "minimal"):
+                        settings[key] = value
+        except (OSError, ValueError, UnicodeError):
             pass
         return settings
+
+    def _load_settings(self):
+        return self._load_settings_section("table")
 
     def _load_feature_settings(self):
-        settings = dict(DEFAULT_CONFIG.get("flags", {}))
+        return self._load_settings_section("flags")
+
+    def _persist_settings(self, sections):
         try:
-            with open("config.json", "r", encoding="utf-8") as config_file:
-                settings.update(json.load(config_file).get("flags", {}))
-        except (OSError, json.JSONDecodeError):
-            pass
-        return settings
+            try:
+                with open(_config_path(), "r", encoding="utf-8") as config_file:
+                    config = json.load(config_file)
+            except FileNotFoundError:
+                config = deepcopy(DEFAULT_CONFIG)
+            if not isinstance(config, dict):
+                raise ValueError("Configuration root must be an object")
+            for section, values in sections.items():
+                existing = config.get(section)
+                config[section] = (dict(existing) if isinstance(existing, dict) else {}) | values
+            save_config(config, _config_path())
+        except (OSError, ValueError, UnicodeError):
+            self.page.open(ft.SnackBar(content=ft.Text("Не удалось сохранить настройки. Проверьте config.json; исходный файл не изменён.")))
+            return False
+        return True
 
     def _save_feature_setting(self, key, value):
-        self.feature_settings[key] = value
-        config = {}
-        try:
-            with open("config.json", "r", encoding="utf-8") as config_file:
-                config = json.load(config_file)
-        except (OSError, json.JSONDecodeError):
-            config = {"flags": {}}
-        config.setdefault("flags", {}).update(self.feature_settings)
-        try:
-            with open("config.json", "w", encoding="utf-8") as config_file:
-                json.dump(config, config_file, indent=4)
-        except OSError:
-            pass
+        if self._persist_settings({"flags": {key: value}}):
+            self.feature_settings[key] = value
+            return True
+        return False
 
     def _refresh_history(self):
         self.history = self.stats_store.get_history(30)
@@ -927,19 +1089,18 @@ class ValorantApp:
         )
 
     def _save_setting(self, key, value):
-        self.settings[key] = value
-        config = {}
-        try:
-            with open("config.json", "r", encoding="utf-8") as config_file:
-                config = json.load(config_file)
-        except (OSError, json.JSONDecodeError):
-            config = {"table": {}}
-        config.setdefault("table", {}).update(self.settings)
-        try:
-            with open("config.json", "w", encoding="utf-8") as config_file:
-                json.dump(config, config_file, indent=4)
-        except OSError:
-            pass
+        if self._persist_settings({"table": {key: value}}):
+            self.settings[key] = value
+            return True
+        return False
+
+    def _reset_settings(self, _):
+        settings = dict(DEFAULT_CONFIG.get("table", {}))
+        features = dict(DEFAULT_CONFIG.get("flags", {}))
+        if self._persist_settings({"table": settings, "flags": features}):
+            self.settings = settings
+            self.feature_settings = features
+        self.render()
 
     def _setting_tile(self, key, label, description):
         return ft.Container(
@@ -970,93 +1131,61 @@ class ValorantApp:
         values = self.settings if section == "table" else self.feature_settings
         save = self._save_setting if section == "table" else self._save_feature_setting
         active = bool(values.get(key, True))
-        icon_control = ft.Icon(icon, size=22, color=ACCENT if active else MUTED)
-        icon_box = ft.Container(
-            width=42,
-            height=42,
-            border_radius=11,
-            bgcolor=ft.Colors.with_opacity(0.14, ACCENT) if active else "#171C25",
-            alignment=ft.alignment.center,
-            content=icon_control,
-        )
-        state_text = ft.Text("ВКЛ", size=8, color=ACCENT if active else MUTED, weight=ft.FontWeight.BOLD)
-        thumb = ft.Container(
-            left=23 if active else 3,
-            top=3,
-            width=18,
-            height=18,
-            border_radius=9,
-            bgcolor="#FFFFFF" if active else "#69717E",
-            shadow=ft.BoxShadow(blur_radius=5, color=ft.Colors.with_opacity(0.35, "#000000")),
-            animate_position=ft.Animation(170, ft.AnimationCurve.EASE_OUT_CUBIC),
-        )
-        toggle = ft.Container(
-            width=44,
-            height=24,
-            border_radius=12,
-            bgcolor=ACCENT if active else "#242B36",
-            animate=ft.Animation(170, ft.AnimationCurve.EASE_OUT),
-            content=ft.Stack(controls=[thumb]),
+        state_text = ft.Text("ВКЛ" if active else "ВЫКЛ", size=8, color=ALLY if active else MUTED)
+        toggle = ft.Switch(
+            value=active,
+            active_color=TEXT,
+            active_track_color=ALLY,
+            inactive_thumb_color=MUTED,
+            inactive_track_color=PANEL_RAISED,
+            tooltip=label,
         )
         card = ft.Container(
             col={"xs": 12, "lg": 6},
-            height=88,
-            padding=12,
-            border_radius=13,
-            bgcolor=SURFACE,
-            border=ft.border.all(1, BORDER),
-            animate=ft.Animation(160, ft.AnimationCurve.EASE_OUT),
-            ink=True,
+            padding=ft.padding.symmetric(horizontal=14, vertical=12),
+            border_radius=12,
+            bgcolor=PANEL,
         )
 
-        def update_visual(enabled):
-            icon_control.color = ACCENT if enabled else MUTED
-            icon_box.bgcolor = ft.Colors.with_opacity(0.14, ACCENT) if enabled else "#171C25"
-            state_text.value = "ВКЛ" if enabled else "ВЫКЛ"
-            state_text.color = ACCENT if enabled else MUTED
-            toggle.bgcolor = ACCENT if enabled else "#242B36"
-            thumb.left = 23 if enabled else 3
-            thumb.bgcolor = "#FFFFFF" if enabled else "#69717E"
-
-        def toggle_setting(_):
+        def toggle_setting(event):
             nonlocal active
-            active = not active
-            values[key] = active
-            save(key, active)
-            update_visual(active)
+            requested = bool(event.control.value) if event is not None and event.control is toggle else not active
+            if save(key, requested):
+                active = requested
+            toggle.value = active
+            state_text.value = "ВКЛ" if active else "ВЫКЛ"
+            state_text.color = ALLY if active else MUTED
             try:
-                icon_box.update()
-                toggle.update()
-                state_text.update()
+                card.update()
             except AssertionError:
                 pass
 
-        def hover_card(event):
-            hovering = str(event.data).lower() == "true"
-            card.bgcolor = "#211920" if hovering and active else "#181E27" if hovering else "#16141A" if active else SURFACE
-            card.update()
-
+        toggle.on_change = toggle_setting
         card.on_click = toggle_setting
         card.content = ft.Row(
+            spacing=12,
             controls=[
-                icon_box,
-                ft.Column(
-                    expand=True,
-                    spacing=3,
-                    alignment=ft.MainAxisAlignment.CENTER,
-                    controls=[
-                        ft.Text(label, size=14, color=TEXT, weight=ft.FontWeight.BOLD),
-                        ft.Text(description, size=10, color=MUTED, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                    ],
-                ),
-                ft.Column(horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=3, controls=[toggle, state_text]),
+                ft.Container(width=34, height=34, border_radius=9, bgcolor=PANEL_RAISED,
+                             alignment=ft.alignment.center, content=ft.Icon(icon, size=17, color=MUTED)),
+                ft.Column(expand=True, spacing=5, controls=[
+                    ft.Text(label, size=13, color=TEXT, weight=ft.FontWeight.W_600),
+                    ft.Text(description, size=11, color=MUTED),
+                ]),
+                ft.Column(horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=0, controls=[toggle, state_text]),
             ],
         )
         return card
 
     def _save_rank_icon_style(self, event):
         selected = next(iter(event.control.selected), "official")
-        self._save_setting("rank_icon_style", selected)
+        if selected not in {"official", "minimal"}:
+            selected = self.settings.get("rank_icon_style", "official")
+        if not self._save_setting("rank_icon_style", selected):
+            event.control.selected = {self.settings.get("rank_icon_style", "official")}
+            try:
+                event.control.update()
+            except AssertionError:
+                pass
 
     def _rank_icon_style_tile(self):
         selected_style = self.settings.get("rank_icon_style", "official")
@@ -1065,14 +1194,14 @@ class ValorantApp:
             border_radius=10,
             bgcolor=SURFACE,
             border=ft.border.all(1, BORDER),
-            content=ft.Row(
+            content=ft.Column(
+                spacing=14,
                 controls=[
                     ft.Column(
-                        expand=True,
-                        spacing=2,
+                        spacing=5,
                         controls=[
                             ft.Text("Эмблемы рангов", size=14, color=TEXT, weight=ft.FontWeight.W_600),
-                            ft.Text("Стиль рангов в подробной карточке игрока", size=11, color=MUTED),
+                            ft.Text("Стиль значков в боковой карточке игрока. На данные ранга не влияет.", size=11, color=MUTED),
                         ],
                     ),
                     ft.SegmentedButton(
@@ -1088,61 +1217,135 @@ class ValorantApp:
             ),
         )
 
-    def _settings_view(self):
-        display_cards = [
-            self._toggle_setting_card("table", "skin", "Скин", "Выбранный weapon skin игрока", ft.Icons.AUTO_AWESOME_ROUNDED),
-            self._toggle_setting_card("table", "rr", "Очки RR", "Текущий ranked rating", ft.Icons.SPEED_ROUNDED),
-            self._toggle_setting_card("table", "peakrank", "Пиковый ранг", "Лучший ранг игрока в сезоне", ft.Icons.WORKSPACE_PREMIUM_ROUNDED),
-            self._toggle_setting_card("table", "previousrank", "Прошлый ранг", "Ранг в предыдущем акте", ft.Icons.HISTORY_ROUNDED),
-            self._toggle_setting_card("table", "leaderboard", "Позиция в рейтинге", "Место игрока в leaderboard", ft.Icons.LEADERBOARD_ROUNDED),
-            self._toggle_setting_card("table", "headshot_percent", "Процент попаданий в голову", "Headshot percentage", ft.Icons.CENTER_FOCUS_STRONG_ROUNDED),
-            self._toggle_setting_card("table", "winrate", "Процент побед", "Win rate и количество игр", ft.Icons.PERCENT_ROUNDED),
-            self._toggle_setting_card("table", "kd", "K/D", "Соотношение убийств и смертей", ft.Icons.QUERY_STATS_ROUNDED),
-            self._toggle_setting_card("table", "level", "Уровень аккаунта", "Уровень профиля VALORANT", ft.Icons.BADGE_ROUNDED),
-            self._toggle_setting_card("table", "earned_rr", "Изменение RR", "Полученный или потерянный RR", ft.Icons.TRENDING_UP_ROUNDED),
-        ]
-        live_cards = [
-            self._toggle_setting_card("flags", "auto_launch_valorant", "Автозапуск VALORANT", "Запускать игру автоматически, если lockfile не найден", ft.Icons.PLAY_CIRCLE_ROUNDED),
-            self._toggle_setting_card("flags", "repeat_encounters", "Повторные встречи", "Метка прошлых матчей с игроком", ft.Icons.REPLAY_ROUNDED),
-            self._toggle_setting_card("flags", "team_average_rank", "Средний ранг команды", "Средний tier и RR каждой команды", ft.Icons.GROUP_WORK_ROUNDED),
-            self._toggle_setting_card("flags", "notifications", "Уведомления", "Главный переключатель уведомлений", ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED),
-            self._toggle_setting_card("flags", "match_start_notification", "Начало матча", "Уведомление при переходе в INGAME", ft.Icons.SPORTS_ESPORTS_ROUNDED),
-            self._toggle_setting_card("flags", "high_rank_notification", "Высокий ранг", "Immortal и Radiant в составе", ft.Icons.MILITARY_TECH_ROUNDED),
-            self._toggle_setting_card("flags", "repeat_encounter_notification", "Знакомый игрок", "Уведомление о повторной встрече", ft.Icons.PERSON_SEARCH_ROUNDED),
-        ]
-        return ft.Column(
-            expand=True,
-            spacing=14,
-            controls=[
-                self._header("DISPLAY CONTROL", "Настройки", "Выберите, какие показатели показывать в тактической сводке."),
-                self._scrollable_column("settings", [
-                        self._settings_section_header("ВИЗУАЛЬНЫЙ СТИЛЬ", "Оформление рангов и подробной карточки"),
-                        self._rank_icon_style_tile(),
-                        self._settings_section_header("ПОКАЗАТЕЛИ ИГРОКА", "Управление информацией в тактической сводке"),
-                        ft.ResponsiveRow(spacing=10, run_spacing=10, controls=display_cards),
-                        self._settings_section_header("LIVE-ФУНКЦИИ", "События матча и интеллектуальные подсказки"),
-                        ft.ResponsiveRow(spacing=10, run_spacing=10, controls=live_cards),
-                        self._settings_section_header("CREDITS", "Авторы и информация о приложении"),
-                        self._credits_card(),
-                    ], spacing=12),
+    def _set_settings_category(self, category):
+        if category == self.settings_category:
+            return
+        self.settings_category = category
+        self._set_scroll_context("settings", category)
+        self.scroll_positions["settings"] = 0
+        self.render()
+
+    def _confirm_reset_settings(self, _):
+        dialog = ft.AlertDialog(
+            modal=True, bgcolor=PANEL,
+            title=ft.Text("Сбросить настройки?", color=TEXT, weight=ft.FontWeight.BOLD),
+            content=ft.Text("Показатели, стиль рангов и функции вернутся к значениям по умолчанию. История матчей не будет удалена.", color=MUTED),
+            actions=[
+                ft.TextButton("Отмена", on_click=lambda _: self.page.close(dialog)),
+                ft.TextButton("Сбросить", style=ft.ButtonStyle(color=ACCENT), on_click=lambda _: self._apply_settings_reset(dialog)),
             ],
+        )
+        self.page.open(dialog)
+
+    def _apply_settings_reset(self, dialog):
+        self.page.close(dialog)
+        self._reset_settings(None)
+
+    def _settings_group(self, title, description, cards):
+        return ft.Container(
+            padding=18, border_radius=14, bgcolor=SURFACE, border=ft.border.all(1, BORDER),
+            content=ft.Column(spacing=14, controls=[
+                self._settings_section_header(title, description),
+                ft.ResponsiveRow(spacing=8, run_spacing=8, controls=cards),
+            ]),
         )
 
+    def _settings_view(self):
+        categories = [
+            ("Отображение", ft.Icons.TUNE_ROUNDED),
+            ("Матч и запуск", ft.Icons.SPORTS_ESPORTS_ROUNDED),
+            ("Уведомления", ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED),
+            ("О приложении", ft.Icons.INFO_OUTLINE_ROUNDED),
+        ]
+        category = self.settings_category
+        if category not in {label for label, _ in categories}:
+            category = self.settings_category = "Отображение"
+        body = []
+        if category == "Отображение":
+            body = [
+                self._settings_group("Статистика", "Показатели в общей таблице. HS% и K/D — за последний завершённый рейтинговый матч.", [
+                    self._toggle_setting_card("table", "headshot_percent", "HS%", "Доля попаданий в голову", ft.Icons.CENTER_FOCUS_STRONG_ROUNDED),
+                    self._toggle_setting_card("table", "kd", "K/D", "Соотношение убийств и смертей", ft.Icons.QUERY_STATS_ROUNDED),
+                    self._toggle_setting_card("table", "winrate", "Процент побед", "WR и число игр за текущий акт", ft.Icons.PERCENT_ROUNDED),
+                    self._toggle_setting_card("table", "earned_rr", "Изменение RR", "Прибавка или потеря за прошлую рейтинговую игру", ft.Icons.TRENDING_UP_ROUNDED),
+                ]),
+                self._settings_group("Ранг и профиль", "Дополнительные сведения об игроках в общей таблице.", [
+                    self._toggle_setting_card("table", "rr", "Очки RR", "Текущие очки рейтинга", ft.Icons.SPEED_ROUNDED),
+                    self._toggle_setting_card("table", "peakrank", "Пиковый ранг", "Лучший достигнутый ранг", ft.Icons.WORKSPACE_PREMIUM_ROUNDED),
+                    self._toggle_setting_card("table", "previousrank", "Прошлый ранг", "Ранг в предыдущем акте", ft.Icons.HISTORY_ROUNDED),
+                    self._toggle_setting_card("table", "leaderboard", "Позиция в рейтинге", "Место в таблице лидеров", ft.Icons.LEADERBOARD_ROUNDED),
+                    self._toggle_setting_card("table", "level", "Уровень аккаунта", "Уровень профиля VALORANT", ft.Icons.BADGE_ROUNDED),
+                    self._toggle_setting_card("table", "skin", "Скин оружия", "Выбранный скин игрока", ft.Icons.AUTO_AWESOME_ROUNDED),
+                ]),
+                ft.Text("Командные панели используют компактный набор показателей; эти переключатели управляют общей таблицей и дополнительными полями.", size=11, color=MUTED),
+                self._rank_icon_style_tile(),
+            ]
+        elif category == "Матч и запуск":
+            body = [self._settings_group("Во время игры", "Подсказки на основе доступных данных клиента и локальной истории.", [
+                self._toggle_setting_card("flags", "repeat_encounters", "Повторные встречи", "Метка игроков, с которыми уже были сохранённые матчи", ft.Icons.REPLAY_ROUNDED),
+                self._toggle_setting_card("flags", "team_average_rank", "Средний ранг команды", "Средний ранг и RR рейтинговых игроков", ft.Icons.GROUP_WORK_ROUNDED),
+            ]), self._settings_group("Запуск", "Поведение при подключении к клиенту.", [
+                self._toggle_setting_card("flags", "auto_launch_valorant", "Автозапуск VALORANT", "Запускать игру, если клиент ещё не обнаружен", ft.Icons.PLAY_CIRCLE_ROUNDED),
+            ])]
+        elif category == "Уведомления":
+            body = [
+                self._settings_group("Внутри приложения", "Управляет всплывающими сообщениями в окне. Системное уведомление о начале матча настраивается отдельно.", [
+                    self._toggle_setting_card("flags", "notifications", "Всплывающие сообщения", "Оповещения внутри приложения", ft.Icons.NOTIFICATIONS_ACTIVE_ROUNDED),
+                ]),
+                self._settings_group("События матча", "Выберите, о каких событиях сообщать.", [
+                    self._toggle_setting_card("flags", "match_start_notification", "Начало матча", "Системное уведомление, когда игра началась", ft.Icons.SPORTS_ESPORTS_ROUNDED),
+                    self._toggle_setting_card("flags", "high_rank_notification", "Высокий ранг", "Игроки Immortal и Radiant в составе", ft.Icons.MILITARY_TECH_ROUNDED),
+                    self._toggle_setting_card("flags", "repeat_encounter_notification", "Знакомый игрок", "Оповещение о предыдущих встречах", ft.Icons.PERSON_SEARCH_ROUNDED),
+                ]),
+                ft.Text("Системные уведомления также зависят от разрешений Windows и режима «Не беспокоить».", size=11, color=MUTED),
+            ]
+        else:
+            body = [self._credits_card(), ft.Container(
+                padding=18, border_radius=14, bgcolor=SURFACE, border=ft.border.all(1, BORDER),
+                content=ft.Column(spacing=10, controls=[
+                    ft.Text("Локальные данные", size=14, color=TEXT, weight=ft.FontWeight.W_600),
+                    ft.Text("Настройки хранятся в config.json рядом с приложением. История матчей — в %APPDATA%\\vry\\stats.json.", size=12, color=MUTED),
+                    ft.Text("Сброс настроек не очищает историю. Удалить матчи можно отдельно во вкладке «История».", size=12, color=MUTED),
+                ]),
+            )]
+        return ft.Column(expand=True, spacing=16, controls=[
+            ft.Row(vertical_alignment=ft.CrossAxisAlignment.CENTER, controls=[
+                ft.Column(expand=True, spacing=6, controls=[
+                    ft.Text("Настройки", size=28, color=TEXT, weight=ft.FontWeight.BOLD),
+                    ft.Text("Ваш интерфейс и поведение приложения", size=12, color=MUTED),
+                ]),
+                ft.TextButton(text="Сбросить", icon=ft.Icons.RESTART_ALT_ROUNDED,
+                              style=ft.ButtonStyle(color=MUTED), on_click=self._confirm_reset_settings),
+            ]),
+            ft.Row(wrap=True, spacing=8, run_spacing=8, controls=[
+                ft.OutlinedButton(text=label, icon=icon,
+                    on_click=lambda _, selected=label: self._set_settings_category(selected),
+                    style=ft.ButtonStyle(
+                        color=TEXT if category == label else MUTED,
+                        bgcolor=PANEL_RAISED if category == label else ft.Colors.TRANSPARENT,
+                        side=ft.BorderSide(1, ALLY if category == label else BORDER),
+                        shape=ft.RoundedRectangleBorder(radius=9),
+                    )) for label, icon in categories
+            ]),
+            ft.Row(spacing=6, controls=[
+                ft.Icon(ft.Icons.CHECK_CIRCLE_OUTLINE_ROUNDED, size=13, color=MUTED),
+                ft.Text("Изменения сохраняются автоматически", size=10, color=MUTED),
+            ]),
+            self._scrollable_column("settings", body, spacing=14),
+        ])
+
     def _settings_section_header(self, title, description):
-        return ft.Row(
-            controls=[
-                ft.Container(width=4, height=28, border_radius=2, bgcolor=ACCENT),
-                ft.Column(spacing=1, controls=[ft.Text(title, size=10, color=ACCENT, weight=ft.FontWeight.BOLD), ft.Text(description, size=10, color=MUTED)]),
-                ft.Container(expand=True, height=1, bgcolor=BORDER),
-            ],
-        )
+        return ft.Column(spacing=5, controls=[
+            ft.Text(title, size=15, color=TEXT, weight=ft.FontWeight.W_600),
+            ft.Text(description, size=11, color=MUTED),
+        ])
 
     def _credits_card(self):
         return ft.Container(
             padding=16,
             border_radius=14,
-            bgcolor=ft.Colors.with_opacity(0.78, "#11151D"),
-            border=ft.border.all(1, ft.Colors.with_opacity(0.38, ACCENT)),
+            bgcolor=SURFACE,
+            border=ft.border.all(1, BORDER),
             content=ft.Row(
                 controls=[
                     ft.Container(
@@ -1158,7 +1361,7 @@ class ValorantApp:
                         spacing=3,
                         controls=[
                             ft.Text("RinoNRC", size=17, color=TEXT, weight=ft.FontWeight.BOLD),
-                            ft.Text("Создатель GUI-сборки", size=11, color=ACCENT, weight=ft.FontWeight.W_600),
+                            ft.Text("Создатель GUI-сборки", size=11, color=MUTED, weight=ft.FontWeight.W_600),
                             ft.Text("Основано на проекте VALORANT rank yoinker", size=10, color=MUTED),
                         ],
                     ),
@@ -1180,12 +1383,18 @@ class ValorantApp:
         )
 
     def _history_view(self):
-        if not self.history:
+        modes = ["Все"] + sorted({str(match.get("mode") or "Неизвестно") for match in self.history})
+        if self.history_mode not in modes:
+            self.history_mode = "Все"
+        visible_history = self.history if self.history_mode == "Все" else [
+            match for match in self.history if str(match.get("mode") or "Неизвестно") == self.history_mode
+        ]
+        if not visible_history:
             return ft.Column(
                 expand=True,
                 spacing=14,
                 controls=[
-                    self._history_header(False),
+                    self._history_header(bool(self.history), modes),
                     ft.Container(
                         expand=True,
                         alignment=ft.alignment.center,
@@ -1211,15 +1420,16 @@ class ValorantApp:
             reverse=True,
         )
         controls = [
-            ft.ResponsiveRow(
-                spacing=10,
+            ft.Row(
+                wrap=True,
+                spacing=18,
+                run_spacing=6,
                 controls=[
-                    self._history_stat("Матчей", len(self.history), ft.Icons.SPORTS_ESPORTS_ROUNDED),
+                    self._history_stat("Матчей", len(visible_history), ft.Icons.SPORTS_ESPORTS_ROUNDED),
                     self._history_stat("Игроков", len(self.encounters), ft.Icons.GROUP_ROUNDED),
                     self._history_stat("Повторных встреч", len(repeated_players), ft.Icons.REPLAY_ROUNDED),
                 ],
             ),
-            self._activity_chart(),
         ]
         if repeated_players:
             controls.append(ft.Text("ЧАСТЫЕ ВСТРЕЧИ", size=10, color=ACCENT, weight=ft.FontWeight.BOLD))
@@ -1246,31 +1456,66 @@ class ValorantApp:
                 )
             )
         controls.append(ft.Text("ПОСЛЕДНИЕ СЕССИИ", size=10, color=ACCENT, weight=ft.FontWeight.BOLD))
-        controls.extend(self._history_match_card(match) for match in self.history)
+        controls.extend(self._history_match_card(match) for match in visible_history)
+        controls.append(
+            ft.ExpansionTile(
+                title=ft.Text("Карты и активность", size=11, color=MUTED),
+                leading=ft.Icon(ft.Icons.INSIGHTS_ROUNDED, size=16, color=MUTED),
+                initially_expanded=False,
+                dense=True,
+                icon_color=MUTED,
+                collapsed_icon_color=MUTED,
+                controls=[self._activity_chart()],
+            )
+        )
         return ft.Column(
             expand=True,
             spacing=14,
             controls=[
-                self._history_header(True),
+                self._history_header(True, modes),
                 self._scrollable_column("history", controls, spacing=10, list_view=True),
             ],
         )
 
-    def _history_header(self, show_clear):
-        return ft.Row(
-            vertical_alignment=ft.CrossAxisAlignment.START,
+    def _history_header(self, show_clear, modes=None):
+        modes = modes or ["Все"]
+        return ft.Column(
+            spacing=12,
             controls=[
-                self._header("LOCAL ARCHIVE", "История", "Уникальные игровые сессии из локального журнала встреч."),
-                ft.Container(expand=True),
-                ft.OutlinedButton(
-                    text="Очистить историю",
-                    icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
-                    visible=show_clear,
-                    style=ft.ButtonStyle(color=ENEMY, side=ft.BorderSide(1, ft.Colors.with_opacity(0.55, ENEMY))),
-                    on_click=self._confirm_clear_history,
+                self._header("LOCAL ARCHIVE", "История", "Сохранённые матчи и встречи. Только данные конкретной игры."),
+                ft.Row(
+                    wrap=True,
+                    spacing=6,
+                    run_spacing=6,
+                    controls=[
+                        *[
+                            ft.OutlinedButton(
+                                text=mode,
+                                on_click=lambda event, selected_mode=mode: self._set_history_mode(selected_mode),
+                                style=ft.ButtonStyle(
+                                    color=TEXT if self.history_mode == mode else MUTED,
+                                    bgcolor=SURFACE_ALT if self.history_mode == mode else SURFACE,
+                                    side=ft.BorderSide(1, ALLY if self.history_mode == mode else BORDER),
+                                ),
+                            )
+                            for mode in modes
+                        ],
+                        ft.TextButton(
+                            text="Очистить историю",
+                            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                            visible=show_clear,
+                            tooltip="Удалить локальный архив — потребуется подтверждение",
+                            style=ft.ButtonStyle(color=MUTED),
+                            on_click=self._confirm_clear_history,
+                        ),
+                    ],
                 ),
             ],
         )
+
+    def _set_history_mode(self, mode):
+        self.history_mode = mode
+        self.render()
 
     def _confirm_clear_history(self, _):
         dialog = ft.AlertDialog(
@@ -1295,15 +1540,14 @@ class ValorantApp:
 
     def _history_stat(self, label, value, icon):
         return ft.Container(
-            col={"xs": 12, "sm": 4},
-            padding=12,
-            border_radius=10,
-            bgcolor=SURFACE_ALT,
-            border=ft.border.all(1, BORDER),
+            padding=ft.padding.symmetric(vertical=4),
             content=ft.Row(
+                tight=True,
+                spacing=6,
                 controls=[
-                    ft.Icon(icon, size=22, color=ACCENT),
-                    ft.Column(spacing=1, controls=[ft.Text(str(value), size=20, color=TEXT, weight=ft.FontWeight.BOLD), ft.Text(label, size=10, color=MUTED)]),
+                    ft.Icon(icon, size=15, color=MUTED),
+                    ft.Text(str(value), size=13, color=TEXT, weight=ft.FontWeight.W_600),
+                    ft.Text(label, size=11, color=MUTED),
                 ],
             ),
         )
@@ -1339,13 +1583,12 @@ class ValorantApp:
             intensity = count / max_day if count else 0
             day_cells.append(
                 ft.Column(
-                    expand=True,
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     spacing=5,
                     controls=[
                         ft.Container(
-                            width=42,
-                            height=48,
+                            width=32,
+                            height=36,
                             border_radius=9,
                             bgcolor=ft.Colors.with_opacity(0.10 + intensity * 0.58, ALLY) if count else "#171D26",
                             border=ft.border.all(1, ft.Colors.with_opacity(0.25 + intensity * 0.45, ALLY) if count else BORDER),
@@ -1363,49 +1606,113 @@ class ValorantApp:
             controls=[
                 ft.Container(
                     col={"xs": 12, "lg": 6},
-                    height=188,
-                    padding=14,
+                    padding=12,
                     border_radius=14,
                     bgcolor=SURFACE,
                     border=ft.border.all(1, BORDER),
-                    content=ft.Column(spacing=9, controls=[ft.Row(controls=[ft.Icon(ft.Icons.MAP_ROUNDED, size=18, color=ACCENT), ft.Text("ПОПУЛЯРНЫЕ КАРТЫ", size=10, color=ACCENT, weight=ft.FontWeight.BOLD), ft.Container(expand=True), ft.Text(f"{sum(map_counts.values())} матчей", size=9, color=MUTED)]), *(map_bars or [ft.Text("Недостаточно данных", size=11, color=MUTED)])]),
+                    content=ft.Column(spacing=9, controls=[ft.Row(controls=[ft.Icon(ft.Icons.MAP_ROUNDED, size=16, color=MUTED), ft.Text("ПОПУЛЯРНЫЕ КАРТЫ", expand=True, size=10, color=MUTED, weight=ft.FontWeight.W_600), ft.Text(f"{sum(map_counts.values())} матчей", size=9, color=MUTED)]), *(map_bars or [ft.Text("Недостаточно данных", size=11, color=MUTED)])]),
                 ),
                 ft.Container(
                     col={"xs": 12, "lg": 6},
-                    height=188,
-                    padding=14,
+                    padding=12,
                     border_radius=14,
                     bgcolor=SURFACE,
                     border=ft.border.all(1, BORDER),
-                    content=ft.Column(spacing=12, controls=[ft.Row(controls=[ft.Icon(ft.Icons.CALENDAR_MONTH_ROUNDED, size=18, color=ALLY), ft.Text("АКТИВНОСТЬ ЗА 10 ДНЕЙ", size=10, color=ALLY, weight=ft.FontWeight.BOLD), ft.Container(expand=True), ft.Text(f"{sum(day_counts.get(day, 0) for day in recent_days)} матчей", size=9, color=MUTED)]), ft.Row(expand=True, alignment=ft.MainAxisAlignment.SPACE_AROUND, vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=4, controls=day_cells)]),
+                    content=ft.Column(spacing=12, controls=[ft.Row(controls=[ft.Icon(ft.Icons.CALENDAR_MONTH_ROUNDED, size=16, color=MUTED), ft.Text("АКТИВНОСТЬ ЗА 10 ДНЕЙ", expand=True, size=10, color=MUTED, weight=ft.FontWeight.W_600), ft.Text(f"{sum(day_counts.get(day, 0) for day in recent_days)} матчей", size=9, color=MUTED)]), ft.Row(wrap=True, run_spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=4, controls=day_cells)]),
                 ),
             ],
         )
 
+    def _history_map_image(self, match, width=None, height=64):
+        fallback = ft.Container(
+            width=width,
+            height=height,
+            bgcolor=SURFACE_ALT,
+            alignment=ft.alignment.center,
+            content=ft.Icon(ft.Icons.MAP_ROUNDED, size=24, color=MUTED),
+        )
+        splash = match.get("mapSplash")
+        if not splash:
+            return fallback
+        return ft.Image(
+            src=splash,
+            width=width,
+            height=height,
+            fit=ft.ImageFit.COVER,
+            border_radius=8,
+            error_content=fallback,
+            semantics_label=f"Карта {match.get('map') or 'неизвестна'}",
+        )
+
+    def _history_personal_stats(self, match):
+        return (match.get("players") or {}).get(match.get("account_puuid")) or {}
+
+    def _history_stats_status(self, match):
+        personal = self._history_personal_stats(match)
+        available = sum(format_stat(personal.get(field)) != "—" for field in ("kills", "deaths", "assists"))
+        if available == 3 and all(format_stat(personal.get(field)) != "—" for field in ("adr", "hs")):
+            return "Статистика этого матча", "Источник: сохранённые результаты именно этого матча."
+        if available:
+            return "Данные матча неполные", STATS_PENDING
+        return "Ожидание итогов матча", STATS_PENDING
+
     def _history_match_card(self, match):
-        players = list(match["players"].values())
-        played_at = datetime.fromtimestamp(match["epoch"]).strftime("%d.%m.%Y  %H:%M") if match["epoch"] else "Unknown"
+        personal = self._history_personal_stats(match)
+        played_at = datetime.fromtimestamp(match["epoch"]).strftime("%d.%m.%Y  %H:%M") if match.get("epoch") else "Дата не сохранена"
+        status, source_hint = self._history_stats_status(match)
+        kda = " / ".join(format_stat(personal.get(field)) for field in ("kills", "deaths", "assists"))
         return ft.Container(
             padding=12,
-            border_radius=10,
+            border_radius=12,
             bgcolor=SURFACE,
             border=ft.border.all(1, BORDER),
             ink=True,
             animate=ft.Animation(140, ft.AnimationCurve.EASE_OUT),
             on_click=lambda _, selected_match=match: self.page.run_task(self._deferred_history_open, selected_match),
-            content=ft.Row(
+            content=ft.ResponsiveRow(
+                spacing=12,
+                run_spacing=12,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
-                    ft.Container(width=4, height=38, border_radius=2, bgcolor=ACCENT),
-                    ft.Column(expand=True, spacing=2, controls=[ft.Text(str(match["map"] or "Unknown"), size=14, color=TEXT, weight=ft.FontWeight.BOLD), ft.Text(f"{match.get('mode') or 'Режим не сохранён'}  /  {played_at}", size=10, color=MUTED)]),
-                    ft.Text(f"{len(players)} игроков", size=11, color=MUTED),
-                    ft.Row(spacing=4, controls=[_rank_badge(player.get("rank")) for player in players[:3]]),
-                    ft.Icon(ft.Icons.CHEVRON_RIGHT_ROUNDED, size=20, color=MUTED),
+                    ft.Row(
+                        col={"xs": 12, "sm": 6},
+                        spacing=12,
+                        controls=[
+                            self._history_map_image(match, width=88),
+                            ft.Column(
+                                expand=True,
+                                spacing=3,
+                                controls=[
+                                    ft.Text(str(match.get("map") or "Карта неизвестна"), size=16, color=TEXT, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                    ft.Text(str(match.get("mode") or "Режим не сохранён"), size=11, color=TEXT, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                    ft.Text(played_at, size=10, color=MUTED),
+                                ],
+                            ),
+                        ],
+                    ),
+                    ft.Column(
+                        col={"xs": 12, "sm": 4},
+                        spacing=3,
+                        controls=[
+                            ft.Text("ВАШ K / D / A", size=9, color=MUTED, weight=ft.FontWeight.W_600),
+                            ft.Text(kda, size=18, color=TEXT, weight=ft.FontWeight.W_600, tooltip=source_hint),
+                            ft.Text(status, size=10, color=MUTED, tooltip=source_hint),
+                        ],
+                    ),
+                    ft.Column(
+                        col={"xs": 12, "sm": 2},
+                        spacing=4,
+                        controls=[
+                            ft.Text("Результат не сохранён", size=10, color=MUTED),
+                            ft.Text(f"{len(match.get('players') or {})} игроков  ·  Подробнее ›", size=10, color=MUTED),
+                        ],
+                    ),
                 ],
             ),
         )
 
     def _history_match_sections(self, match):
-        players = list(match["players"].values())
+        players = list((match.get("players") or {}).values())
         teams = {}
         for player in players:
             team = str(player.get("team") or "")
@@ -1427,39 +1734,86 @@ class ValorantApp:
                 label = "ВАША КОМАНДА" if team == account_team else "ПРОТИВНИКИ"
             else:
                 label = {"blue": "СИНЯЯ КОМАНДА", "red": "КРАСНАЯ КОМАНДА"}.get(team.lower(), f"КОМАНДА {team.upper()}")
-            color = ALLY if team == account_team or team.lower() == "blue" else ENEMY
+            color = (ALLY if team == account_team else ENEMY) if account_team else (ALLY if team.lower() == "blue" else ENEMY)
             sections.append((label, color, sorted(teams[team], key=rank_score, reverse=True)))
+        if teams.get(""):
+            sections.append(("КОМАНДА НЕ СОХРАНЕНА", MUTED, sorted(teams[""], key=rank_score, reverse=True)))
         return sections
 
-    def _history_player_row(self, player, is_self=False):
+    def _history_player_row(self, player, is_self=False, is_deathmatch=False):
+        party_status = _party_badge(player)
+        if party_status.visible is False:
+            if not player.get("partyResolved"):
+                party_tooltip = "Данные о пати ещё не проверены по результатам этого матча."
+            elif player.get("partyId") is None:
+                party_tooltip = "Данные о пати не предоставлены в результатах этого матча."
+            else:
+                party_tooltip = "Нет подтверждённой группы в результатах этого матча."
+            party_status = ft.Icon(
+                ft.Icons.INFO_OUTLINE_ROUNDED,
+                size=12,
+                color=MUTED,
+                tooltip=party_tooltip + " Отсутствие метки не означает соло.",
+            )
         return ft.Container(
             padding=ft.padding.symmetric(horizontal=10, vertical=8),
             border_radius=9,
-            bgcolor="#1B171E" if is_self else "#0D1118",
-            border=ft.border.all(1, ft.Colors.with_opacity(0.55, ACCENT) if is_self else BORDER),
-            content=ft.Row(
+            bgcolor=SELF_SURFACE if is_self else SURFACE,
+            border=ft.border.all(1, ft.Colors.with_opacity(0.45, ALLY) if is_self else BORDER),
+            content=ft.ResponsiveRow(
+                spacing=4,
+                run_spacing=7,
                 controls=[
                     ft.Container(
+                        col={"xs": 2, "sm": 1},
                         visible=is_self,
-                        padding=ft.padding.symmetric(horizontal=5, vertical=2),
+                        padding=ft.padding.symmetric(horizontal=4, vertical=3),
                         border_radius=5,
-                        bgcolor=ACCENT,
-                        content=ft.Text("ВЫ", size=7, color="#FFFFFF", weight=ft.FontWeight.BOLD),
+                        bgcolor=ft.Colors.with_opacity(0.14, ALLY),
+                        content=ft.Text("ВЫ", size=8, color=ALLY, weight=ft.FontWeight.BOLD),
                     ),
                     ft.Column(
+                        col={"xs": 10 if is_self else 12, "sm": 11 if is_self else 12},
                         expand=True,
-                        spacing=1,
+                        spacing=2,
                         controls=[
-                            ft.Text(player.get("name", "Unknown"), size=13, color=TEXT, weight=ft.FontWeight.BOLD, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                            ft.Row(
+                                spacing=5,
+                                controls=[
+                                    ft.Text(player.get("name", "Unknown"), expand=True, size=13, color=TEXT, weight=ft.FontWeight.BOLD, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                    party_status,
+                                ],
+                            ),
                             ft.Text(player.get("agent", "Unknown"), size=10, color=MUTED),
                         ],
                     ),
-                    _rank_badge(player.get("rank")),
-                    ft.Container(width=58, alignment=ft.alignment.center_right, content=ft.Text(f"{player.get('rr', 0)} RR", size=11, color=ACCENT, weight=ft.FontWeight.BOLD)),
+                    ft.Container(col={"xs": 8, "sm": 9}, content=_rank_badge(player.get("rank"))),
+                    ft.Container(
+                        col={"xs": 4, "sm": 3},
+                        alignment=ft.alignment.center_right,
+                        content=ft.Text(f"{format_stat(player.get('rr'))} RR", size=11, color=TEXT, weight=ft.FontWeight.W_500),
+                    ),
+                    ft.Column(col={"xs": 3, "sm": 2}, visible=not is_deathmatch, spacing=2, controls=[
+                        ft.Text("K/D", size=8, color=MUTED),
+                        ft.Text(format_stat(player.get("kd")), size=11, color=self._stat_color("kd", player.get("kd")) or TEXT, tooltip=STATS_PENDING if format_stat(player.get("kd")) == "—" else self._stat_hint("kd")),
+                    ]),
+                    ft.Column(col={"xs": 3, "sm": 2}, visible=not is_deathmatch, spacing=2, controls=[
+                        ft.Text("HS", size=8, color=MUTED),
+                        ft.Text(format_stat(player.get("hs"), "%"), size=11, color=self._stat_color("headshot_percent", player.get("hs")) or TEXT, tooltip=STATS_PENDING if format_stat(player.get("hs")) == "—" else self._stat_hint("headshot_percent")),
+                    ]),
+                    ft.Column(col={"xs": 3, "sm": 2}, spacing=2, controls=[
+                        ft.Text("ADR", size=8, color=MUTED),
+                        ft.Text(format_stat(player.get("adr")), size=11, color=self._stat_color("adr", player.get("adr")) or TEXT, tooltip=self._stat_hint("adr")),
+                    ]),
+                    ft.Column(col={"xs": 6, "sm": 4}, spacing=2, controls=[
+                        ft.Text("K / D / A", size=8, color=MUTED),
+                        ft.Text(f"{format_stat(player.get('kills'))} / {format_stat(player.get('deaths'))} / {format_stat(player.get('assists'))}", size=11, color=TEXT),
+                    ]),
                     ft.TextButton(
+                        col={"xs": 3, "sm": 2},
                         text="VTL",
-                        icon=ft.Icons.OPEN_IN_NEW_ROUNDED,
                         tooltip="Открыть профиль VTL.LOL",
+                        style=ft.ButtonStyle(color=MUTED),
                         on_click=lambda _, puuid=player.get("puuid"): self._open_history_vtl(puuid),
                     ),
                 ],
@@ -1474,73 +1828,124 @@ class ValorantApp:
         await asyncio.sleep(0.06)
         self._show_history_match(match)
 
-    def _show_history_match(self, match):
-        self.player_panel_open = True
-        played_at = datetime.fromtimestamp(match["epoch"]).strftime("%d.%m.%Y  %H:%M") if match["epoch"] else "Unknown"
-        hero_background = (
-            ft.Image(src=match.get("mapSplash"), left=0, top=0, right=0, bottom=0, fit=ft.ImageFit.COVER, opacity=0.42)
-            if match.get("mapSplash")
-            else ft.Container(left=0, top=0, right=0, bottom=0, bgcolor=SURFACE_ALT)
+    def _history_detail_metric(self, label, value, col, tooltip=None, color=TEXT):
+        return ft.Container(
+            col=col,
+            padding=12,
+            border_radius=10,
+            bgcolor=SURFACE_ALT,
+            tooltip=tooltip,
+            content=ft.Column(
+                spacing=5,
+                controls=[
+                    ft.Text(label.upper(), size=9, color=MUTED, weight=ft.FontWeight.W_600),
+                    ft.Text(str(value), size=18, color=color, weight=ft.FontWeight.W_600),
+                ],
+            ),
         )
+
+    def _show_history_match(self, match):
+        self._set_scroll_context("history-detail", match.get("match_id"))
+        self.history_match_id = match.get("match_id")
+        self.player_panel_open = True
+        played_at = datetime.fromtimestamp(match["epoch"]).strftime("%d.%m.%Y  %H:%M") if match.get("epoch") else "Дата не сохранена"
+        personal = self._history_personal_stats(match)
+        status, source_hint = self._history_stats_status(match)
+        mode = str(match.get("mode") or "").strip().lower()
+        is_deathmatch = mode in {"deathmatch", "death match", "team deathmatch", "team death match", "tdm"}
         controls = [
+            ft.Row(
+                spacing=8,
+                controls=[
+                    ft.Text("ДЕТАЛИ МАТЧА", expand=True, size=10, color=MUTED, weight=ft.FontWeight.W_600),
+                    ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_color=MUTED, tooltip="Закрыть детали матча", on_click=self._close_player_panel),
+                ],
+            ),
             ft.Container(
-                height=130,
-                border_radius=13,
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                content=ft.Stack(
+                padding=12,
+                border_radius=12,
+                bgcolor=SURFACE_ALT,
+                content=ft.Row(
+                    spacing=12,
                     controls=[
-                        hero_background,
-                        ft.Container(left=0, top=0, right=0, bottom=0, gradient=ft.LinearGradient(begin=ft.alignment.center_left, end=ft.alignment.center_right, colors=["#080B10", ft.Colors.with_opacity(0.45, "#080B10")])),
-                        ft.Container(
-                            left=0,
-                            top=0,
-                            right=0,
-                            bottom=0,
-                            padding=14,
-                            content=ft.Column(
-                                alignment=ft.MainAxisAlignment.CENTER,
-                                spacing=4,
-                                controls=[
-                                    ft.Text(str(match.get("map") or "Unknown"), size=25, color=TEXT, weight=ft.FontWeight.BOLD),
-                                    ft.Text(f"{match.get('mode') or 'Режим не сохранён'}  /  {played_at}", size=11, color=MUTED),
-                                ],
-                            ),
+                        self._history_map_image(match, width=88, height=80),
+                        ft.Column(
+                            expand=True,
+                            spacing=4,
+                            controls=[
+                                ft.Text(str(match.get("map") or "Карта неизвестна"), size=22, color=TEXT, weight=ft.FontWeight.W_600),
+                                ft.Text(str(match.get("mode") or "Режим не сохранён"), size=11, color=TEXT),
+                                ft.Text(played_at, size=10, color=MUTED),
+                                ft.Text("Результат не сохранён", size=10, color=MUTED),
+                            ],
                         ),
-                        ft.IconButton(right=5, top=5, icon=ft.Icons.CLOSE_ROUNDED, icon_color=TEXT, on_click=self._close_player_panel),
                     ],
                 ),
             ),
             ft.ResponsiveRow(
                 spacing=8,
+                run_spacing=8,
                 controls=[
-                    self._detail_metric("Игроков", len(match["players"])),
-                    self._detail_metric("Сервер", match.get("server") or "N/A"),
-                    self._detail_metric("Match ID", str(match["match_id"])[:12] + "..."),
+                    self._history_detail_metric("Ваш K / D / A", " / ".join(format_stat(personal.get(field)) for field in ("kills", "deaths", "assists")), {"xs": 12, "sm": 6}, tooltip=source_hint),
+                    self._history_detail_metric("Ваш ADR", format_stat(personal.get("adr")), {"xs": 6, "sm": 3}, tooltip=source_hint + "\n" + self._stat_hint("adr"), color=self._stat_color("adr", personal.get("adr")) or TEXT),
+                    self._history_detail_metric("Ваш HS", format_stat(personal.get("hs"), "%"), {"xs": 6, "sm": 3}, tooltip=source_hint + "\n" + self._stat_hint("headshot_percent"), color=self._stat_color("headshot_percent", personal.get("hs")) or TEXT),
                 ],
             ),
-            ft.Row(
-                alignment=ft.MainAxisAlignment.END,
-                controls=[
-                    ft.Icon(ft.Icons.SORT_ROUNDED, size=16, color=ACCENT),
-                    ft.Text("Сортировка: ранг ↓", size=10, color=MUTED, weight=ft.FontWeight.W_600),
-                ],
-            ),
-        ]
-        for label, color, players in self._history_match_sections(match):
-            controls.append(
-                ft.Row(
+            ft.Container(
+                padding=10,
+                border_radius=8,
+                bgcolor=SURFACE,
+                content=ft.Column(
+                    spacing=4,
                     controls=[
-                        ft.Container(width=7, height=7, border_radius=4, bgcolor=color),
-                        ft.Text(label, size=10, color=color, weight=ft.FontWeight.BOLD),
-                        ft.Container(expand=True, height=1, bgcolor=BORDER),
-                        ft.Text(str(len(players)), size=10, color=MUTED),
+                        ft.Text(status, size=11, color=TEXT, weight=ft.FontWeight.W_500),
+                        ft.Text(source_hint, size=10, color=MUTED),
+                        ft.Text("«—» означает, что данные не получены; это не нулевое значение.", size=10, color=MUTED),
                     ],
+                ),
+            ),
+            ft.Text(f"{_server_name(match.get('server'))}  ·  {len(match.get('players') or {})} игроков", size=10, color=MUTED),
+            ft.Text(f"Match ID: {match.get('match_id') or '—'}", size=10, color=MUTED, selectable=True),
+            ft.Text(
+                "Пати определены по результатам этого матча. Без метки — нет подтверждённой группы.",
+                size=10,
+                color=MUTED,
+            ),
+            ft.Text("Отсутствие метки не означает соло. Статус проверки доступен у имени игрока.", size=10, color=MUTED),
+            self._stats_color_legend(),
+            ft.Text("СОСТАВЫ  ·  Сортировка: ранг ↓", size=10, color=MUTED, weight=ft.FontWeight.W_600),
+        ]
+        sections = []
+        for label, color, players in self._history_match_sections(match):
+            sections.append(
+                ft.Container(
+                    col={"xs": 12, "md": 6},
+                    padding=8,
+                    border_radius=10,
+                    bgcolor=SURFACE_ALT,
+                    content=ft.Column(
+                        spacing=7,
+                        controls=[
+                            ft.Row(
+                                controls=[
+                                    ft.Container(width=3, height=14, border_radius=2, bgcolor=color),
+                                    ft.Text(label, expand=True, size=10, color=color, weight=ft.FontWeight.W_600),
+                                    ft.Text(str(len(players)), size=10, color=MUTED),
+                                ],
+                            ),
+                            *[
+                                self._history_player_row(player, player is personal, is_deathmatch)
+                                for player in players
+                            ],
+                        ],
+                    ),
                 )
             )
-            controls.extend(self._history_player_row(player, player.get("puuid") == match.get("account_puuid")) for player in players)
+        controls.append(ft.ResponsiveRow(spacing=10, run_spacing=10, controls=sections))
 
-        self.player_panel.width = 520
-        self.player_panel.content = ft.Column(expand=True, scroll=ft.ScrollMode.HIDDEN, spacing=9, controls=controls)
+        viewport = self._viewport_width()
+        self.player_panel.width = min(860, max(0, viewport - 16))
+        self.player_panel.content = self._scrollable_column("history-detail", controls, spacing=9)
         self.player_panel.right = 0
         self.player_scrim.visible = True
         if hasattr(self.page, "overlay"):
@@ -1551,43 +1956,46 @@ class ValorantApp:
                 pass
         else:
             self.page.update()
-        self.page.run_task(self._restore_history_scroll)
-
-    async def _restore_history_scroll(self):
-        # Flet may perform a second layout pass after an overlay is opened.
-        for delay in (0.08, 0.25, 0.5):
-            await asyncio.sleep(delay)
-            control = self.scroll_controls.get("history")
-            offset = self.scroll_positions.get("history", 0)
-            if control is not None and offset > 0:
-                try:
-                    control.scroll_to(offset=offset, duration=0)
-                except AssertionError:
-                    pass
 
     def _diagnostics_view(self):
         heartbeat = self.snapshot.get("heartbeat") or {}
-        heartbeat_at = self.snapshot.get("heartbeat_at") or self.snapshot.get("updated_at", time.time())
-        age = max(0, int(time.time() - heartbeat_at))
-        uptime = max(0, int(time.time() - self.snapshot.get("started_at", time.time())))
+        now = time.time()
+        heartbeat_at = self.snapshot.get("heartbeat_at")
+        age = max(0, int(now - heartbeat_at)) if heartbeat_at is not None else None
+        uptime = max(0, int(now - (self.snapshot.get("started_at") or now)))
         error = self.snapshot.get("error")
-        quality = "Стабильно" if age < 5 else "Задержка" if age < 15 else "Нет обновлений"
-        quality_color = "#4BC487" if age < 5 else "#E6C24F" if age < 15 else ENEMY
+        has_error = bool(error) or self.snapshot.get("status") == "Error"
+        if has_error:
+            quality, quality_color = "Ошибка monitor", ENEMY
+        elif not heartbeat or age is None:
+            quality, quality_color = "Ожидание данных", MUTED
+        elif age < 5:
+            quality, quality_color = "Данные обновлены", "#4BC487"
+        else:
+            quality, quality_color = "Ожидание событий", MUTED
+        heartbeat_points = self.snapshot.get("heartbeat_history") or []
+        heartbeat_rate = "-"
+        if len(heartbeat_points) >= 2:
+            elapsed = heartbeat_points[-1] - heartbeat_points[0]
+            if elapsed > 0:
+                heartbeat_rate = f"{(len(heartbeat_points) - 1) / elapsed:.1f}/сек"
         puuid = str(heartbeat.get("puuid") or "")
         match_id = str(heartbeat.get("matchId") or "")
         diagnostics = [
-            ("Monitor", "Ошибка" if error else "Активен", ENEMY if error else "#4BC487"),
-            ("Riot Client", "Подключён" if heartbeat else "Ожидание", "#4BC487" if heartbeat else "#E6C24F"),
+            ("Monitor", "Ошибка" if has_error else "Активен", ENEMY if has_error else "#4BC487"),
+            ("Riot Client", "Ошибка" if has_error else "Данные получены" if heartbeat else "Ожидание", ENEMY if has_error else "#4BC487" if heartbeat else "#E6C24F"),
             ("Качество", quality, quality_color),
             ("Game state", heartbeat.get("state", "Unknown"), ACCENT),
             ("Region", str(heartbeat.get("region", "Unknown")).upper(), TEXT),
-            ("Heartbeat", f"{age} сек. назад", TEXT if age < 10 else "#E6C24F"),
+            ("Heartbeat", f"{age} сек. назад" if age is not None else "Ещё не получен", TEXT),
+            ("Частота обновлений", heartbeat_rate, TEXT),
             ("Uptime", self._format_duration(uptime), TEXT),
             ("Players", len(heartbeat.get("players") or {}), TEXT),
             ("Server", _server_name(heartbeat.get("server")), MUTED),
             ("Version", heartbeat.get("appVersion", version), MUTED),
             ("Account", f"{puuid[:8]}...{puuid[-4:]}" if len(puuid) > 12 else "N/A", MUTED),
             ("Match ID", f"{match_id[:8]}...{match_id[-4:]}" if len(match_id) > 12 else "N/A", MUTED),
+            ("События", f"{len(self.snapshot.get('events') or [])} / 100", TEXT),
         ]
         controls = [
             ft.Row(
@@ -1620,6 +2028,7 @@ class ValorantApp:
                 ],
             )
         )
+        controls.append(ft.Text("Monitor ожидает события WebSocket; пауза между обновлениями во время матча не означает разрыв соединения.", size=11, color=MUTED))
         controls.append(self._connection_timeline())
         controls.append(self._heartbeat_graph())
         if error:
@@ -1650,7 +2059,7 @@ class ValorantApp:
 
     def _connection_timeline(self):
         heartbeat = self.snapshot.get("heartbeat") or {}
-        error = bool(self.snapshot.get("error"))
+        error = bool(self.snapshot.get("error")) or self.snapshot.get("status") == "Error"
         connected = bool(heartbeat)
         steps = [
             ("Riot Client", connected, ft.Icons.DESKTOP_WINDOWS_ROUNDED),
@@ -1674,7 +2083,7 @@ class ValorantApp:
         if not gaps:
             gaps = [0.1]
         max_gap = max(gaps)
-        bars = [ft.Container(width=8, height=max(8, int(48 * gap / max_gap)), border_radius=3, bgcolor=ENEMY if gap > 5 else "#4BC487" if gap < 2 else "#E6C24F") for gap in gaps[-30:]]
+        bars = [ft.Container(width=8, height=max(8, int(48 * gap / max_gap)), border_radius=3, bgcolor=ALLY) for gap in gaps[-30:]]
         return ft.Container(padding=12, border_radius=12, bgcolor=SURFACE, border=ft.border.all(1, BORDER), content=ft.Column(spacing=6, controls=[ft.Row(controls=[ft.Text("HEARTBEAT GRAPH", size=9, color=ACCENT, weight=ft.FontWeight.BOLD), ft.Container(expand=True), ft.Text(f"{len(points)} точек", size=9, color=MUTED)]), ft.Container(height=62, content=ft.Row(alignment=ft.MainAxisAlignment.END, vertical_alignment=ft.CrossAxisAlignment.END, spacing=4, controls=bars))]))
 
     def _format_duration(self, seconds):
@@ -1738,6 +2147,7 @@ class ValorantApp:
         updated_text = datetime.fromtimestamp(updated_at).strftime("%H:%M:%S") if updated_at else "Unknown"
         state = account.get("state") or "Unknown"
         state_color = "#4BC487" if state == "INGAME" else ACCENT if state == "PREGAME" else ALLY
+        stale = updated_at and time.time() - updated_at > 30
         agent_label = player.get("agent") or "Агент не выбран"
         return self._scrollable_column("account", [
                 ft.Row(
@@ -1754,6 +2164,14 @@ class ValorantApp:
                     ],
                 ),
                 self._account_hero(account, player, agent_label),
+                ft.Container(
+                    visible=bool(stale),
+                    padding=10,
+                    border_radius=9,
+                    bgcolor=ft.Colors.with_opacity(0.12, "#E6C24F"),
+                    border=ft.border.all(1, ft.Colors.with_opacity(0.38, "#E6C24F")),
+                    content=ft.Row(controls=[ft.Icon(ft.Icons.SYNC_PROBLEM_ROUNDED, size=16, color="#E6C24F"), ft.Text("Данные профиля давно не обновлялись", size=11, color="#E6C24F")]),
+                ),
                 ft.Text("РЕЙТИНГ", size=10, color=ACCENT, weight=ft.FontWeight.BOLD),
                 ft.Container(
                     padding=14,
@@ -1773,14 +2191,15 @@ class ValorantApp:
                     spacing=10,
                     run_spacing=10,
                     controls=[
-                        self._detail_metric("RR", player.get("rr", "-"), ACCENT),
+                        self._detail_metric("RR", player.get("rr", "—")),
                         self._detail_metric("ΔRR", player.get("earnedRR", "-"), self._heat_color("earned_rr", player) or TEXT),
                         self._detail_metric("Leaderboard", f"#{player.get('leaderboard')}" if player.get("leaderboard") else "-"),
-                        self._detail_metric("HS%", f"{player.get('headshotPercentage', '-')}%", self._heat_color("headshot_percent", player) or TEXT),
+                        self._detail_metric("HS%", format_stat(player.get('headshotPercentage'), '%'), self._heat_color("headshot_percent", player) or TEXT, tooltip=recent_stats_caption(player)),
                         self._detail_metric("Win rate", player.get("winPercentage", "-"), self._heat_color("winrate", player) or TEXT),
-                        self._detail_metric("K/D", player.get("kd", "-"), self._heat_color("kd", player) or TEXT),
+                        self._detail_metric("K/D", format_stat(player.get("kd")), self._heat_color("kd", player) or TEXT, tooltip=recent_stats_caption(player)),
                     ],
                 ),
+                ft.Text(recent_stats_caption(player), size=10, color=MUTED),
                 self._account_rank_progress(player),
                 self._account_recent_stats(player),
                 ft.Text("ТЕКУЩАЯ СЕССИЯ", size=10, color=ACCENT, weight=ft.FontWeight.BOLD),
@@ -1869,7 +2288,7 @@ class ValorantApp:
             if agent:
                 agents[agent] = agents.get(agent, 0) + 1
         favorite = max(agents, key=agents.get) if agents else "N/A"
-        return ft.Column(spacing=8, controls=[ft.Text("ПОСЛЕДНИЕ 20 МАТЧЕЙ", size=10, color=ACCENT, weight=ft.FontWeight.BOLD), ft.ResponsiveRow(spacing=10, controls=[self._detail_metric("Матчи", len(entries)), self._detail_metric("Средний HS%", f"{sum(hs) / len(hs):.1f}%" if hs else "N/A"), self._detail_metric("Средний K/D", f"{sum(kd) / len(kd):.2f}" if kd else "N/A"), self._detail_metric("Средний WR", f"{sum(wins) / len(wins):.1f}%" if wins else "N/A"), self._detail_metric("Любимый агент", favorite)])])
+        return ft.Column(spacing=8, controls=[ft.Text("ЛОКАЛЬНАЯ ИСТОРИЯ · ДО 20 ИГР · ВСЕ РЕЖИМЫ", size=10, color=ACCENT, weight=ft.FontWeight.BOLD), ft.ResponsiveRow(spacing=10, controls=[self._detail_metric("Матчи", len(entries)), self._detail_metric("Средний HS%", f"{sum(hs) / len(hs):.1f}%" if hs else "N/A"), self._detail_metric("Средний K/D", f"{sum(kd) / len(kd):.2f}" if kd else "N/A"), self._detail_metric("Средний WR", f"{sum(wins) / len(wins):.1f}%" if wins else "N/A"), self._detail_metric("Любимый агент", favorite)])])
 
     def _account_context_item(self, label, value, icon):
         return ft.Container(
@@ -1920,7 +2339,7 @@ class ValorantApp:
             spacing=5,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER if centered else ft.CrossAxisAlignment.START,
             controls=[
-                ft.Text(eyebrow, size=10, color=ACCENT, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER if centered else None),
+                ft.Row(controls=[ft.Container(width=4, height=14, border_radius=2, bgcolor=ACCENT), ft.Text(eyebrow, size=10, color=ACCENT, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER if centered else None)], tight=True, spacing=7),
                 ft.Text(title, size=30, color=TEXT, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER if centered else None),
                 ft.Text(description, size=13, color=MUTED, text_align=ft.TextAlign.CENTER if centered else None),
             ],
@@ -1959,7 +2378,7 @@ class ValorantApp:
                     border_radius=10,
                     bgcolor="#2A151A",
                     border=ft.border.all(1, "#5B2730"),
-                    content=ft.Text(error, color="#FF9DA6", size=11, text_align=ft.TextAlign.CENTER),
+                    content=ft.Text(error, color="#FF9DA6", size=11, text_align=ft.TextAlign.CENTER, max_lines=4, overflow=ft.TextOverflow.ELLIPSIS),
                 )
             )
         waiting_content = ft.Container(
@@ -1980,6 +2399,29 @@ class ValorantApp:
         )
 
     def _match_loading_view(self, error=None):
+        heartbeat = self.snapshot.get("heartbeat") or {}
+        if error:
+            self.shimmer_controls = []
+            return self._waiting_view(
+                "LIVE SESSION",
+                "Не удалось получить данные",
+                "Монитор остановил обновление. Проверьте подключение к Riot Client.",
+                ft.Icons.SYNC_PROBLEM_ROUNDED,
+                "Подробности ошибки",
+                "Диагностика и журналы помогут определить причину.",
+                error,
+            )
+        if heartbeat.get("state") == "MENUS":
+            self.shimmer_controls = []
+            return self._waiting_view(
+                "LIVE SESSION",
+                "Лобби найдено",
+                "Данные игры получены, но состав пати пока недоступен.",
+                ft.Icons.GROUP_OUTLINED,
+                "Нет данных об участниках",
+                "Состав появится после получения party roster от Riot Client.",
+            )
+
         skeletons = []
         for index in range(5):
             skeleton = ft.Container(
@@ -2015,102 +2457,97 @@ class ValorantApp:
             controls.insert(1, ft.Container(padding=10, border_radius=9, bgcolor="#2A151A", content=ft.Text(error, size=10, color="#FF9DA6")))
         return ft.Column(expand=True, spacing=8, controls=controls)
 
+    def _hero_chip(self, label, color=MUTED):
+        return ft.Container(
+            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            border_radius=6,
+            bgcolor=ft.Colors.with_opacity(0.10, color),
+            content=ft.Text(label, size=9, color=color, weight=ft.FontWeight.W_600),
+        )
+
     def _match_hero(self, heartbeat, compact=False):
         splash = heartbeat.get("mapSplash")
         map_name = _map_name(heartbeat.get("map"))
-        state = str(heartbeat.get("state", "Unknown"))
-        mode = str(heartbeat.get("mode", "Unknown"))
-        own_team = heartbeat.get("ownTeam")
-        side_name = {"blue": "Синяя команда", "red": "Красная команда"}.get(str(own_team).lower()) if own_team else None
-        background = (
-            ft.Image(src=splash, left=0, top=0, right=0, bottom=0, fit=ft.ImageFit.COVER, opacity=0.54)
-            if splash
-            else ft.Container(left=0, top=0, right=0, bottom=0, bgcolor=SURFACE_ALT)
+        state = str(heartbeat.get("state") or "Unknown")
+        mode = str(heartbeat.get("mode") or "Режим неизвестен")
+        side = starting_side(heartbeat)
+        side_label, side_color, side_icon = {
+            "attack": ("Атака", ENEMY, ft.Icons.FLASH_ON_ROUNDED),
+            "defense": ("Защита", ALLY, ft.Icons.SHIELD_OUTLINED),
+        }.get(side, ("Нет данных", MUTED, ft.Icons.HELP_OUTLINE_ROUNDED))
+        side_hint = (
+            "Стартовая сторона по TeamID: Red — атака, Blue — защита. Текущая сторона после смены половин или в овертайме не отслеживается."
+            if side else "Сторона неизвестна или не применяется к этому режиму."
         )
+        background = ft.Container(left=0, top=0, right=0, bottom=0, bgcolor=PANEL)
+        if splash:
+            background = ft.Image(
+                src=splash, left=0, top=0, right=0, bottom=0,
+                fit=ft.ImageFit.COVER, opacity=0.30,
+                error_content=ft.Container(bgcolor=PANEL),
+            )
         return ft.Container(
-            height=122 if compact else 158,
+            height=150 if compact else 166,
             border_radius=16,
             clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            border=ft.border.all(1, "#343B48"),
-            content=ft.Stack(
-                controls=[
-                    background,
-                    ft.Container(
-                        left=0,
-                        top=0,
-                        right=0,
-                        bottom=0,
-                        gradient=ft.LinearGradient(
-                            begin=ft.alignment.center_left,
-                            end=ft.alignment.center_right,
-                            colors=["#080B10", ft.Colors.with_opacity(0.78, "#080B10"), ft.Colors.with_opacity(0.18, "#080B10")],
-                        ),
+            border=ft.border.all(1, BORDER),
+            content=ft.Stack(controls=[
+                background,
+                ft.Container(
+                    left=0, top=0, right=0, bottom=0,
+                    gradient=ft.LinearGradient(
+                        begin=ft.alignment.center_left, end=ft.alignment.center_right,
+                        colors=[BACKGROUND, ft.Colors.with_opacity(0.90, BACKGROUND), ft.Colors.with_opacity(0.50, BACKGROUND)],
                     ),
-                    ft.Container(
-                        right=18,
-                        bottom=-8,
-                        content=ft.Text(
-                            map_name.upper(),
-                            size=52,
-                            color=ft.Colors.with_opacity(0.16, "#FFFFFF"),
-                            weight=ft.FontWeight.BOLD,
-                            no_wrap=True,
-                        ),
-                    ),
-                    ft.Container(
-                        left=0,
-                        top=0,
-                        right=0,
-                        bottom=0,
-                        padding=ft.padding.symmetric(horizontal=22, vertical=12 if compact else 18),
-                        alignment=ft.alignment.center_left,
-                        content=ft.Column(
-                            alignment=ft.MainAxisAlignment.CENTER,
-                            spacing=9,
-                            controls=[
-                                ft.Row(
-                                    spacing=7,
-                                    controls=[
-                                        ft.Container(
-                                            padding=ft.padding.symmetric(horizontal=8, vertical=3),
-                                            border_radius=6,
-                                            bgcolor=ACCENT,
-                                            content=ft.Text(state.upper(), size=9, color="#FFFFFF", weight=ft.FontWeight.BOLD),
-                                        ),
-                                        ft.Container(
-                                            padding=ft.padding.symmetric(horizontal=8, vertical=3),
-                                            border_radius=6,
-                                            bgcolor=ft.Colors.with_opacity(0.20, "#FFFFFF"),
-                                            content=ft.Text(mode.upper(), size=9, color=TEXT, weight=ft.FontWeight.W_600),
-                                        ),
-                                    ],
+                ),
+                ft.Container(
+                    left=0, top=0, right=0, bottom=0,
+                    padding=ft.padding.symmetric(horizontal=20, vertical=14),
+                    content=ft.Column(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        spacing=8,
+                        controls=[
+                            ft.Row(spacing=6, controls=[
+                                self._hero_chip({"INGAME": "В МАТЧЕ", "PREGAME": "ВЫБОР АГЕНТА", "MENUS": "ЛОББИ"}.get(state, "ОЖИДАНИЕ"), self._status_color(state)),
+                                self._hero_chip(mode.upper()),
+                                ft.Container(expand=True),
+                                ft.Text("ТАКТИЧЕСКАЯ СВОДКА", size=9, color=MUTED, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                            ]),
+                            ft.Row(spacing=14, controls=[
+                                ft.Column(expand=True, spacing=5, controls=[
+                                    ft.Text(map_name if map_name != "-" else "Ожидание карты", size=28 if compact else 32, color=TEXT, weight=ft.FontWeight.BOLD, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                    ft.Row(spacing=6, wrap=True, run_spacing=3, controls=[
+                                        ft.Icon(ft.Icons.DNS_ROUNDED, size=13, color=MUTED),
+                                        ft.Text(_server_name(heartbeat.get("server")), size=11, color=MUTED),
+                                        ft.Text("·", color=MUTED, size=11),
+                                        ft.Text(f"{len(heartbeat.get('players') or {})} игроков", size=11, color=MUTED),
+                                    ]),
+                                ]),
+                                ft.Container(
+                                    padding=ft.padding.symmetric(horizontal=12, vertical=9),
+                                    border_radius=10,
+                                    bgcolor=ft.Colors.with_opacity(0.08, side_color),
+                                    tooltip=side_hint,
+                                    content=ft.Row(tight=True, spacing=8, controls=[
+                                        ft.Icon(side_icon, size=21, color=side_color),
+                                        ft.Column(tight=True, spacing=3, controls=[
+                                            ft.Text("СТАРТОВАЯ СТОРОНА", size=8, color=MUTED),
+                                            ft.Text(side_label, size=16, color=side_color, weight=ft.FontWeight.W_600),
+                                        ]),
+                                    ]),
                                 ),
-                                ft.Text("Тактическая сводка", size=28 if compact else 32, color=TEXT, weight=ft.FontWeight.BOLD),
-                                ft.Row(
-                                    spacing=7,
-                                    controls=[
-                                        ft.Icon(ft.Icons.MAP_ROUNDED, size=15, color=ACCENT),
-                                        ft.Text(map_name, size=13, color="#D7DCE5", weight=ft.FontWeight.W_600),
-                                        ft.Text("/", size=12, color=MUTED),
-                                        ft.Text(f"{len(heartbeat.get('players') or {})} игроков", size=12, color=MUTED),
-                                        ft.Text("/", size=12, color=MUTED),
-                                        ft.Icon(ft.Icons.DNS_ROUNDED, size=15, color=ALLY),
-                                        ft.Text(_server_name(heartbeat.get("server")), size=12, color="#D7DCE5", weight=ft.FontWeight.W_600),
-                                        ft.Container(
-                                            visible=bool(side_name),
-                                            margin=ft.margin.only(left=4),
-                                            padding=ft.padding.symmetric(horizontal=7, vertical=3),
-                                            border_radius=6,
-                                            bgcolor=ft.Colors.with_opacity(0.14, ALLY if str(own_team).lower() == "blue" else ENEMY),
-                                            content=ft.Text(side_name or "", size=10, color=ALLY if str(own_team).lower() == "blue" else ENEMY, weight=ft.FontWeight.BOLD),
-                                        ),
-                                    ],
-                                ),
-                            ],
-                        ),
+                            ]),
+                            ft.Row(spacing=7, controls=[
+                                ft.Icon(ft.Icons.INFO_OUTLINE_ROUNDED, size=13, color=MUTED),
+                                ft.Text("HS% / K/D · ПОСЛЕДНИЙ РЕЙТИНГОВЫЙ МАТЧ", expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, size=9, color=MUTED,
+                                        tooltip="Показатели последнего завершённого рейтингового матча, не текущей игры. WR — за текущий акт."),
+                                ft.Icon(ft.Icons.GROUP_OUTLINED, size=15, color=MUTED,
+                                        tooltip="Показаны только подтверждённые пати; отсутствие метки не означает соло."),
+                            ]),
+                        ],
                     ),
-                ]
-            ),
+                ),
+            ]),
         )
 
     def _set_sort(self, column_key):
@@ -2263,8 +2700,8 @@ class ValorantApp:
 
         sections = self._player_sections(heartbeat, players)
         mode = str(heartbeat.get("mode") or "").strip().lower()
-        is_deathmatch = mode in {"deathmatch", "death match"}
-        use_team_panels = len(sections) == 2 and mode not in {"deathmatch", "death match"} and self._viewport_width() >= 1200
+        is_deathmatch = mode in {"deathmatch", "death match", "team deathmatch", "tdm"}
+        use_team_panels = len(sections) == 2 and not is_deathmatch and self._viewport_width() >= 1200
         compact_match = use_team_panels or len(players) > 6
         self._wide_team_layout = self._viewport_width() >= 1200
         if use_team_panels:
@@ -2318,6 +2755,7 @@ class ValorantApp:
             spacing=14,
             controls=[
                 self.hero_switcher,
+                self._stats_color_legend(),
                 self._scrollable_column("match", body, spacing=5 if compact_match else 10, enabled=is_deathmatch),
             ],
         )
@@ -2461,22 +2899,18 @@ class ValorantApp:
             error_content=fallback,
         )
 
-    def _player_hover(self, event, is_self=False, base_color="#0D1118"):
+    def _player_hover(self, event, is_self=False, base_color=PANEL):
         hovering = str(event.data).lower() == "true"
-        if hovering:
-            event.control.bgcolor = "#2A1C23" if is_self else "#181E28"
-            event.control.border = ft.border.all(1, ft.Colors.with_opacity(0.72, ACCENT))
-        else:
-            event.control.bgcolor = "#1B171E" if is_self else base_color
-            event.control.border = ft.border.all(1, ft.Colors.with_opacity(0.62, ACCENT) if is_self else BORDER)
+        event.control.bgcolor = PANEL_RAISED if hovering else SELF_SURFACE if is_self else base_color
+        event.control.border = ft.border.all(1, ft.Colors.with_opacity(0.40, ALLY) if is_self else MUTED if hovering else BORDER)
         event.control.update()
 
     def _team_player_card(self, player, is_self, team_color):
         return ft.Container(
             padding=ft.padding.symmetric(horizontal=8, vertical=5),
             border_radius=9,
-            bgcolor="#1B171E" if is_self else "#0D1118",
-            border=ft.border.all(1, ft.Colors.with_opacity(0.62, ACCENT) if is_self else BORDER),
+            bgcolor=SELF_SURFACE if is_self else PANEL,
+            border=ft.border.all(1, ft.Colors.with_opacity(0.40, ALLY) if is_self else BORDER),
             animate=ft.Animation(140, ft.AnimationCurve.EASE_OUT),
             ink=True,
             on_hover=lambda event, own=is_self: self._player_hover(event, own),
@@ -2504,8 +2938,8 @@ class ValorantApp:
                                                     visible=is_self,
                                                     padding=ft.padding.symmetric(horizontal=4, vertical=1),
                                                     border_radius=4,
-                                                    bgcolor=ACCENT,
-                                                    content=ft.Text("ВЫ", size=7, color="#FFFFFF", weight=ft.FontWeight.BOLD),
+                                                    bgcolor=ft.Colors.with_opacity(0.18, ALLY),
+                                                    content=ft.Text("ВЫ", size=7, color=ALLY, weight=ft.FontWeight.BOLD),
                                                 ),
                                                 ft.Text(
                                                     player.get("name", "Unknown"),
@@ -2516,17 +2950,11 @@ class ValorantApp:
                                                     max_lines=1,
                                                     overflow=ft.TextOverflow.ELLIPSIS,
                                                 ),
-                                                ft.Container(
-                                                    visible=bool(player.get("partyNumber")),
-                                                    padding=ft.padding.symmetric(horizontal=4, vertical=1),
-                                                    border_radius=4,
-                                                    bgcolor=ft.Colors.with_opacity(0.14, ACCENT),
-                                                    content=ft.Text(f"P{player.get('partyNumber', '')}", size=7, color=ACCENT, weight=ft.FontWeight.BOLD),
-                                                ),
+                                                _party_badge(player),
                                                 self._encounter_badge(player),
                                             ],
                                         ),
-                                        ft.Text("Скрытый ник" if player.get("streamerMode") else player.get("agent", "Agent pending"), size=10, color=team_color),
+                                        ft.Text("Скрытый ник" if player.get("streamerMode") else player.get("agent", "Agent pending"), size=10, color=MUTED),
                                     ],
                                 ),
                             ],
@@ -2704,17 +3132,14 @@ class ValorantApp:
                 "skin": player.get("skin", "-"),
                 "rr": player.get("rr", 0),
                 "leaderboard": f"#{player.get('leaderboard')}" if str(player.get("leaderboard", "0")) not in {"", "0", "None"} else "-",
-                "headshot_percent": f"{player.get('headshotPercentage', '-')}%",
+                "headshot_percent": format_stat(player.get('headshotPercentage'), '%'),
                 "winrate": player.get("winPercentage", "-"),
-                "kd": player.get("kd", "-"),
+                "kd": format_stat(player.get("kd")),
                 "level": player.get("level", "-"),
                 "earned_rr": earned_rr,
             }
             value = str(values.get(key, "-"))
-            if key == "earned_rr":
-                color = "#4BC487" if earned_number > 0 else ENEMY if earned_number < 0 else MUTED
-            else:
-                color = ACCENT if key == "rr" else TEXT if key == "skin" else MUTED
+            color = self._heat_color(key, player) or (MUTED if key in {"earned_rr", "level", "leaderboard"} else TEXT)
             content = ft.Text(
                 value,
                 size=11 if key == "skin" else 12,
@@ -2722,59 +3147,83 @@ class ValorantApp:
                 weight=ft.FontWeight.W_600,
                 max_lines=1,
                 overflow=ft.TextOverflow.ELLIPSIS,
-                tooltip=value if key == "skin" else None,
+                tooltip=recent_stats_caption(player) if key in {"headshot_percent", "kd"} else value if key == "skin" else None,
             )
             heat_color = self._heat_color(key, player)
             if heat_color:
                 content = ft.Container(
                     padding=ft.padding.symmetric(horizontal=6, vertical=4),
                     border_radius=6,
-                    bgcolor=ft.Colors.with_opacity(0.13, heat_color),
-                    border=ft.border.all(1, ft.Colors.with_opacity(0.24, heat_color)),
+                    bgcolor=ft.Colors.with_opacity(0.09, heat_color),
+                    tooltip=self._stat_hint(key) or None,
                     content=content,
                 )
         return ft.Container(expand=weight, alignment=ft.alignment.center_left, content=content)
 
-    def _heat_color(self, key, player):
+    def _stat_color(self, key, value):
+        if isinstance(value, str):
+            tokens = value.strip().split()
+            value = tokens[0].rstrip("%") if tokens else None
+        if isinstance(value, bool) or format_stat(value) == "—":
+            return None
+        number = float(value)
         if key == "earned_rr":
-            value = player.get("earnedRR")
-            thresholds = (1, 0)
-        elif key == "rr":
-            value = player.get("rr")
-            thresholds = (70, 30)
-        elif key == "headshot_percent":
-            value = player.get("headshotPercentage")
-            thresholds = (28, 18)
-        elif key == "winrate":
-            value = str(player.get("winPercentage", "")).split(" ", 1)[0]
-            thresholds = (53, 47)
-        elif key == "kd":
-            value = player.get("kd")
-            thresholds = (1.15, 0.9)
-        else:
+            return SUCCESS if number > 0 else ENEMY if number < 0 else None
+        thresholds = {
+            "headshot_percent": (18, 28),
+            "winrate": (47, 53),
+            "kd": (0.9, 1.15),
+            "adr": (120, 150),
+        }
+        if key not in thresholds or number < 0:
             return None
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
+        if key in {"headshot_percent", "winrate"} and number > 100:
             return None
-        if number >= thresholds[0]:
-            return "#4BC487"
-        if number >= thresholds[1]:
-            return "#E6C24F"
-        return ENEMY
+        low, high = thresholds[key]
+        return SUCCESS if number >= high else WARNING if number >= low else ENEMY
 
-    def _detail_metric(self, label, value, color=TEXT):
+    def _heat_color(self, key, player):
+        fields = {
+            "headshot_percent": "headshotPercentage", "winrate": "winPercentage",
+            "kd": "kd", "adr": "adr", "earned_rr": "earnedRR",
+        }
+        return self._stat_color(key, player.get(fields.get(key)))
+
+    def _stat_hint(self, key):
+        return {
+            "headshot_percent": "HS%: низкий <18% · средний 18–<28% · высокий ≥28%.",
+            "winrate": "WR: низкий <47% · средний 47–<53% · высокий ≥53%. За текущий акт.",
+            "kd": "K/D: низкий <0.90 · средний 0.90–<1.15 · высокий ≥1.15.",
+            "adr": "ADR: низкий <120 · средний 120–<150 · высокий ≥150.",
+        }.get(key, "")
+
+    def _stats_color_legend(self):
+        return ft.Row(
+            spacing=10,
+            run_spacing=5,
+            wrap=True,
+            controls=[
+                ft.Text("ШКАЛА", size=9, color=MUTED),
+                *[ft.Row(tight=True, spacing=4, controls=[
+                    ft.Container(width=5, height=5, border_radius=3, bgcolor=color),
+                    ft.Text(label, size=9, color=MUTED),
+                ]) for label, color in (("Низкий", ENEMY), ("Средний", WARNING), ("Высокий", SUCCESS))],
+                ft.Text("Условные ориентиры", size=9, color=MUTED, tooltip="Условные ориентиры, не оценка навыка. HS% и K/D в live-сводке относятся к одной прошлой игре; учитывайте агента, оружие и размер выборки."),
+            ],
+        )
+
+    def _detail_metric(self, label, value, color=TEXT, tooltip=None):
         return ft.Container(
+            tooltip=tooltip or (STATS_PENDING if value == "—" else None),
             col={"xs": 6, "md": 4},
-            padding=12,
-            border_radius=10,
-            bgcolor="#0D1118",
-            border=ft.border.all(1, BORDER),
+            padding=14,
+            border_radius=12,
+            bgcolor=ft.Colors.with_opacity(0.07, color) if color in {SUCCESS, WARNING, ENEMY} else PANEL_RAISED,
             content=ft.Column(
-                spacing=3,
+                spacing=6,
                 controls=[
-                    ft.Text(label.upper(), size=9, color=MUTED, weight=ft.FontWeight.BOLD),
-                    ft.Text(str(value), size=15, color=color, weight=ft.FontWeight.BOLD),
+                    ft.Text(label.upper(), size=9, color=MUTED, weight=ft.FontWeight.W_600),
+                    ft.Text(str(value), size=20, color=color, weight=ft.FontWeight.BOLD),
                 ],
             ),
         )
@@ -2845,94 +3294,117 @@ class ValorantApp:
                 f"https://tracker.gg/valorant/profile/riot/{quote(riot_id, safe='')}/overview"
             )
 
-    def _show_player_card(self, player):
-        self.player_panel_open = True
-        self.selected_player = player
-        self.player_inventory_open = False
-        dialog = ft.AlertDialog(
-            modal=True,
-            bgcolor=SURFACE,
-            surface_tint_color=SURFACE,
-            inset_padding=24,
-            content_padding=20,
-            shape=ft.RoundedRectangleBorder(radius=16),
-            content=ft.Container(
-                width=414,
-                content=ft.Column(
-                    tight=True,
-                    spacing=16,
-                    controls=[
-                        ft.Row(
-                            controls=[
-                                ft.Image(src=player.get("agentImgLink"), width=64, height=64, border_radius=14, fit=ft.ImageFit.COVER)
-                                if player.get("agentImgLink")
-                                else ft.Container(width=64, height=64, border_radius=14, bgcolor=SURFACE_ALT, alignment=ft.alignment.center, content=ft.Icon(ft.Icons.PERSON_ROUNDED, size=30, color=MUTED)),
-                                ft.Column(
-                                    expand=True,
-                                    spacing=3,
-                                    controls=[
-                                        ft.Text(player.get("name", "Unknown"), size=24, color=TEXT, weight=ft.FontWeight.BOLD),
-                                        ft.Text(
-                                            f"{'Скрытый ник  /  ' if player.get('streamerMode') else ''}{player.get('agent', 'Unknown agent')}  /  LEVEL {player.get('level', '-')}",
-                                            size=12,
-                                            color=MUTED,
-                                        ),
-                                    ],
-                                ),
-                                ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_color=MUTED, on_click=self._close_player_panel),
-                            ],
-                        ),
-                        ft.Row(
-                            spacing=18,
-                            controls=[
-                                ft.Column(spacing=4, controls=[ft.Text("ТЕКУЩИЙ", size=8, color=MUTED), self._card_rank_badge(player.get("rank"), player.get("rankIcon"))]),
-                                ft.Column(spacing=4, controls=[ft.Text("ПИКОВЫЙ", size=8, color=MUTED), self._card_rank_badge(player.get("peakRank"), player.get("peakRankIcon"), player.get("peakRankAct"))]),
-                                ft.Column(spacing=4, controls=[ft.Text("ПРОШЛЫЙ", size=8, color=MUTED), self._card_rank_badge(player.get("previousRank"), player.get("previousRankIcon"))]),
-                            ],
-                        ),
-                        ft.ResponsiveRow(
-                            spacing=9,
-                            run_spacing=9,
-                            controls=[
-                                self._detail_metric("RR", player.get("rr", "-"), ACCENT),
-                                self._detail_metric("HS%", f"{player.get('headshotPercentage', '-')}%", self._heat_color("headshot_percent", player) or TEXT),
-                                self._detail_metric("Win rate", player.get("winPercentage", "-"), self._heat_color("winrate", player) or TEXT),
-                                self._detail_metric("K/D", player.get("kd", "-"), self._heat_color("kd", player) or TEXT),
-                                self._detail_metric("Leaderboard", f"#{player.get('leaderboard')}" if player.get("leaderboard") else "-"),
-                                self._detail_metric("ΔRR", player.get("earnedRR", "-"), self._heat_color("earned_rr", player) or TEXT),
-                            ],
-                        ),
-                        ft.Container(
-                            padding=12,
-                            border_radius=10,
-                            bgcolor="#0D1118",
-                            border=ft.border.all(1, BORDER),
-                            content=ft.Row(
-                                controls=[
-                                    ft.Icon(ft.Icons.AUTO_AWESOME_ROUNDED, color=ACCENT, size=20),
-                                    ft.Column(
-                                        spacing=2,
-                                        controls=[
-                                            ft.Text("ВЫБРАННЫЙ СКИН", size=8, color=MUTED, weight=ft.FontWeight.BOLD),
-                                            ft.Text(player.get("skin", "Не определён"), size=13, color=TEXT, weight=ft.FontWeight.W_600),
-                                        ],
-                                    ),
-                                ],
-                            ),
-                        ),
-                    ],
-                ),
+    def _player_card_section(self, title, controls, description=None):
+        return ft.Column(
+            spacing=10,
+            controls=[
+                ft.Text(title, size=10, color=MUTED, weight=ft.FontWeight.BOLD),
+                *([ft.Text(description, size=11, color=MUTED)] if description else []),
+                *controls,
+            ],
+        )
+
+    def _player_encounters_view(self, player):
+        heartbeat = self.snapshot.get("heartbeat") or {}
+        if player.get("puuid") == heartbeat.get("puuid"):
+            description = "Это ваш профиль. Встречи с самим собой не учитываются."
+        else:
+            count = self._past_encounter_count(player.get("puuid"), heartbeat.get("matchId"))
+            description = f"Предыдущих встреч: {count}" if count else "Ранее не встречались в локальном журнале."
+        return ft.Container(
+            padding=14,
+            border_radius=12,
+            bgcolor=PANEL_RAISED,
+            content=ft.Row(
+                spacing=10,
+                controls=[
+                    ft.Icon(ft.Icons.HISTORY_ROUNDED, size=20, color=MUTED),
+                    ft.Column(expand=True, spacing=4, controls=[
+                        ft.Text(description, size=12, color=TEXT),
+                        ft.Text("Только сохранённые на этом устройстве матчи", size=10, color=MUTED),
+                    ]),
+                ],
             ),
         )
-        details = dialog.content
+
+    def _show_player_card(self, player):
+        same_player = self.player_panel_open and self.history_match_id is None and getattr(self, "selected_player", {}).get("puuid") == player.get("puuid")
+        inventory_open = same_player and getattr(self, "player_inventory_open", False)
+        self.history_match_id = None
+        self.player_panel_open = True
+        self.selected_player = player
+        self.player_inventory_open = inventory_open
+        heartbeat = self.snapshot.get("heartbeat") or {}
+        self._set_scroll_context("player-detail", (heartbeat.get("puuid"), heartbeat.get("matchId"), player.get("puuid")))
+        caption = recent_stats_caption(player)
+        latest_metrics = [
+            self._detail_metric("HS%", format_stat(player.get("headshotPercentage"), "%"), self._heat_color("headshot_percent", player) or TEXT, tooltip=caption + "\n" + self._stat_hint("headshot_percent")),
+            self._detail_metric("K/D", format_stat(player.get("kd")), self._heat_color("kd", player) or TEXT, tooltip=caption + "\n" + self._stat_hint("kd")),
+        ]
+        for metric in latest_metrics:
+            metric.col = 6
+        delta = format_stat(player.get("earnedRR"))
+        if self._heat_color("earned_rr", player) == SUCCESS:
+            delta = f"+{float(player['earnedRR']):g}"
+        leaderboard = player.get("leaderboard")
+        leaderboard = f"#{leaderboard}" if str(leaderboard or "0") not in {"0", "-", "N/A", "None"} else "—"
+        rank_history = ft.ResponsiveRow(spacing=12, run_spacing=12, controls=[
+            ft.Container(col=6, content=ft.Column(spacing=6, controls=[
+                ft.Text("ПИКОВЫЙ РАНГ", size=9, color=MUTED),
+                self._card_rank_badge(player.get("peakRank"), player.get("peakRankIcon"), player.get("peakRankAct")),
+            ])),
+            ft.Container(col=6, content=ft.Column(spacing=6, controls=[
+                ft.Text("ПРОШЛЫЙ АКТ", size=9, color=MUTED),
+                self._card_rank_badge(player.get("previousRank"), player.get("previousRankIcon")),
+            ])),
+        ])
+        details = ft.Container(
+            expand=True,
+            content=ft.Column(expand=True, spacing=22, scroll=ft.ScrollMode.HIDDEN, controls=[
+                ft.Row(controls=[
+                    ft.Text("ПРОФИЛЬ ИГРОКА", expand=True, size=10, color=MUTED, weight=ft.FontWeight.BOLD),
+                    ft.IconButton(icon=ft.Icons.CLOSE_ROUNDED, icon_color=MUTED, tooltip="Закрыть профиль", on_click=self._close_player_panel),
+                ]),
+                ft.Row(spacing=14, controls=[
+                    self._agent_avatar(player, 64),
+                    ft.Column(expand=True, spacing=7, controls=[
+                        ft.Text(player.get("name", "Unknown"), size=23, color=TEXT, weight=ft.FontWeight.BOLD, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                        ft.Text(f"{'Скрытый ник · ' if player.get('streamerMode') else ''}{player.get('agent') or 'Агент не выбран'} · Уровень {player.get('level', '—')}", size=11, color=MUTED),
+                        ft.Row(spacing=6, wrap=True, controls=[_party_badge(player), self._encounter_badge(player)]),
+                    ]),
+                ]),
+                self._player_card_section("ТЕКУЩИЙ РАНГ", [
+                    ft.Container(padding=14, border_radius=12, bgcolor=PANEL_RAISED, content=ft.Row(controls=[
+                        ft.Container(expand=True, content=self._card_rank_badge(player.get("rank"), player.get("rankIcon"))),
+                        ft.Column(spacing=2, horizontal_alignment=ft.CrossAxisAlignment.END, controls=[
+                            ft.Text(format_stat(player.get("rr")), size=25, color=TEXT, weight=ft.FontWeight.BOLD),
+                            ft.Text("RR", size=10, color=MUTED),
+                        ]),
+                    ])),
+                    rank_history,
+                ]),
+                self._player_card_section("ПОСЛЕДНИЙ РЕЙТИНГОВЫЙ МАТЧ", [
+                    ft.ResponsiveRow(spacing=8, run_spacing=8, controls=latest_metrics),
+                    self._stats_color_legend(),
+                ], description=caption),
+                self._player_card_section("ТЕКУЩИЙ АКТ", [
+                    ft.ResponsiveRow(spacing=8, run_spacing=8, controls=[
+                        self._detail_metric("Win rate", player.get("winPercentage") or "—", self._heat_color("winrate", player) or TEXT, tooltip=self._stat_hint("winrate")),
+                        self._detail_metric("ΔRR", delta, self._heat_color("earned_rr", player) or TEXT, tooltip="Изменение RR за последнюю рейтинговую игру; не результат текущего матча"),
+                        self._detail_metric("Leaderboard", leaderboard),
+                    ]),
+                ]),
+                self._player_card_section("ЛОКАЛЬНЫЕ ВСТРЕЧИ", [self._player_encounters_view(player)]),
+            ]),
+        )
         self.player_inventory_button = ft.ElevatedButton(
-            text="Показать все скины",
+            text="Скрыть все скины" if inventory_open else "Показать все скины",
             icon=ft.Icons.AUTO_AWESOME_ROUNDED,
-            style=self._primary_button_style(),
+            style=self._secondary_button_style(),
             on_click=self._toggle_player_inventory,
         )
         self.player_inventory_container = ft.Container(
-            visible=False,
+            visible=inventory_open,
             padding=ft.padding.only(top=4),
             content=self._player_inventory_view(player),
         )
@@ -2941,7 +3413,6 @@ class ValorantApp:
             spacing=6,
             wrap=True,
             controls=[
-                self.player_inventory_button,
                 ft.OutlinedButton(
                     text="VTL.LOL",
                     icon=ft.Icons.OPEN_IN_NEW_ROUNDED,
@@ -2967,15 +3438,18 @@ class ValorantApp:
             ],
         )
         details.content.controls.extend([
-            external_actions,
-            self.player_inventory_container,
+            self._player_card_section("СКИНЫ И ОРУЖИЕ", [
+                ft.Text(player.get("skin") or "Выбранный скин не определён", size=12, color=TEXT),
+                self.player_inventory_button,
+                self.player_inventory_container,
+            ]),
+            self._player_card_section("ПРОФИЛИ И ДЕЙСТВИЯ", [external_actions]),
         ])
-        details.width = None
-        details.expand = True
-        details.content.tight = False
-        details.content.expand = True
-        details.content.scroll = ft.ScrollMode.HIDDEN
-        self.player_panel.width = 450
+        details.content = self._scrollable_column("player-detail", details.content.controls, spacing=22)
+        self.player_panel.width = min(480, max(280, self._viewport_width() - 24))
+        if (isinstance(self.player_panel.content, ft.Container)
+                and self.player_panel.content.content is details.content):
+            details = self.player_panel.content
         self.player_panel.content = details
         self.player_panel.right = 0
         self.player_scrim.visible = True
@@ -2984,9 +3458,9 @@ class ValorantApp:
             self.player_scrim.update()
         except AssertionError:
             pass
-        self.page.run_task(self._restore_scroll, "match")
 
     def _close_player_panel(self, _=None, update=True):
+        self.history_match_id = None
         self.player_panel_open = False
         self.player_panel.right = -(self.player_panel.width + 20)
         self.player_scrim.visible = False
@@ -2996,9 +3470,6 @@ class ValorantApp:
                 self.player_scrim.update()
             except AssertionError:
                 pass
-            scroll_id = {0: "match", 1: "history"}.get(self.selected_view)
-            if scroll_id:
-                self.page.run_task(self._restore_scroll, scroll_id)
 
     def _player_row(self, player, is_self=False, compact=False):
         team = str(player.get("team") or "")
@@ -3006,15 +3477,15 @@ class ValorantApp:
         return ft.Container(
             padding=ft.padding.symmetric(horizontal=10 if compact else 14, vertical=3 if compact else 8),
             border_radius=8 if compact else 10,
-            bgcolor="#1B171E" if is_self else SURFACE,
-            border=ft.border.all(1, ft.Colors.with_opacity(0.58, ACCENT) if is_self else BORDER),
+            bgcolor=SELF_SURFACE if is_self else SURFACE,
+            border=ft.border.all(1, ft.Colors.with_opacity(0.40, ALLY) if is_self else BORDER),
             animate=ft.Animation(140, ft.AnimationCurve.EASE_OUT),
             ink=True,
             on_click=lambda _, selected_player=player: self._show_player_card(selected_player),
             content=ft.Row(
                 spacing=4,
                 controls=[
-                    ft.Container(width=3, height=26 if compact else 38, border_radius=2, bgcolor=ACCENT if is_self else team_color),
+                    ft.Container(width=3, height=26 if compact else 38, border_radius=2, bgcolor=ALLY if is_self else team_color),
                     ft.Container(
                         width=210,
                         content=ft.Row(
@@ -3032,8 +3503,8 @@ class ValorantApp:
                                                     visible=is_self,
                                                     padding=ft.padding.symmetric(horizontal=5, vertical=1),
                                                     border_radius=5,
-                                                    bgcolor=ACCENT,
-                                                    content=ft.Text("ВЫ", size=7, color="#FFFFFF", weight=ft.FontWeight.BOLD),
+                                                    bgcolor=ft.Colors.with_opacity(0.18, ALLY),
+                                                    content=ft.Text("ВЫ", size=7, color=ALLY, weight=ft.FontWeight.BOLD),
                                                 ),
                                                 ft.Text(
                                                     player.get("name", "Unknown"),
@@ -3045,13 +3516,7 @@ class ValorantApp:
                                                     overflow=ft.TextOverflow.ELLIPSIS,
                                                     tooltip=player.get("name", "Unknown"),
                                                 ),
-                                                ft.Container(
-                                                    visible=bool(player.get("partyNumber")),
-                                                    padding=ft.padding.symmetric(horizontal=5, vertical=1),
-                                                    border_radius=5,
-                                                    bgcolor=ft.Colors.with_opacity(0.14, ACCENT),
-                                                    content=ft.Text(f"P{player.get('partyNumber', '')}", size=7, color=ACCENT, weight=ft.FontWeight.BOLD),
-                                                ),
+                                                _party_badge(player),
                                                 self._encounter_badge(player),
                                             ],
                                         ),
@@ -3101,7 +3566,7 @@ class ValorantApp:
             spacing=14,
             controls=[
                 self._header("LOCAL INVENTORY", "Скины игроков", "Нажмите на игрока, чтобы развернуть его инвентарь."),
-                ft.Column(expand=True, scroll=ft.ScrollMode.HIDDEN, spacing=9, controls=body),
+                self._scrollable_column("skins", body, spacing=9),
             ],
         )
 

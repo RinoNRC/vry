@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
+cd /d "%~dp0"
 
 REM Define supported Python versions X.Y.Z for easy future updates
 set SUPPORTED_MIN_VERSION=3.10
@@ -57,8 +58,15 @@ if !max_result! gtr 0 (
     exit /b
 )
 
-REM Install requirements
-pip install -r requirements.txt
+REM Install into the same local environment used by START.bat
+if not exist ".venv\Scripts\python.exe" (
+    python -m venv .venv
+    if errorlevel 1 (
+        call :error "Could not create the local Python environment."
+        exit /b 1
+    )
+)
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if %errorlevel% neq 0 (
     call :error "There was an error installing the requirements. Please check the output above for more details."
     exit /b
